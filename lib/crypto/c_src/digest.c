@@ -1,7 +1,7 @@
 /*
  * %CopyrightBegin%
  *
- * Copyright Ericsson AB 2010-2018. All Rights Reserved.
+ * Copyright Ericsson AB 2010-2020. All Rights Reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -22,60 +22,89 @@
 
 static struct digest_type_t digest_types[] =
 {
-    {{"md4"}, {&EVP_md4}},
-    {{"md5"}, {&EVP_md5}},
-    {{"ripemd160"}, {&EVP_ripemd160}},
-    {{"sha"}, {&EVP_sha1}},
-    {{"sha224"},
+    {{"md4"}, NO_FIPS_DIGEST,
+#ifdef HAVE_MD4
+     {&EVP_md4}
+#else
+    {NULL}
+#endif
+    },
+
+    {{"md5"}, NO_FIPS_DIGEST,
+#ifdef HAVE_MD5
+     {&EVP_md5}
+#else
+     {NULL}
+#endif
+    },
+
+    {{"ripemd160"}, NO_FIPS_DIGEST,
+#ifdef HAVE_RIPEMD160
+     {&EVP_ripemd160}
+#else
+     {NULL}
+#endif
+    },
+
+    {{"sha"}, 0, {&EVP_sha1}},
+
+    {{"sha224"}, 0,
 #ifdef HAVE_SHA224
      {&EVP_sha224}
 #else
      {NULL}
 #endif
     },
-    {{"sha256"},
+
+    {{"sha256"}, 0,
 #ifdef HAVE_SHA256
      {&EVP_sha256}
 #else
      {NULL}
 #endif
     },
-    {{"sha384"},
+
+    {{"sha384"}, 0,
 #ifdef HAVE_SHA384
      {&EVP_sha384}
 #else
      {NULL}
 #endif
     },
-    {{"sha512"},
+
+    {{"sha512"}, 0,
 #ifdef HAVE_SHA512
      {&EVP_sha512}
 #else
      {NULL}
 #endif
     },
-    {{"sha3_224"},
+
+    {{"sha3_224"}, 0,
 #ifdef HAVE_SHA3_224
      {&EVP_sha3_224}
 #else
      {NULL}
 #endif
     },
-    {{"sha3_256"},
+
+    {{"sha3_256"}, 0,
 #ifdef HAVE_SHA3_256
      {&EVP_sha3_256}
 #else
      {NULL}
 #endif
     },
-    {{"sha3_384"},
+
+    {{"sha3_384"}, 0,
 #ifdef HAVE_SHA3_384
      {&EVP_sha3_384}
 #else
      {NULL}
 #endif
     },
-    {{"sha3_512"},
+
+    {{"sha3_512"}, 0,
 #ifdef HAVE_SHA3_512
      {&EVP_sha3_512}
 #else
@@ -83,7 +112,24 @@ static struct digest_type_t digest_types[] =
 #endif
     },
 
-    {{NULL}}
+    {{"blake2b"}, 0,
+#ifdef HAVE_BLAKE2
+     {&EVP_blake2b512}
+#else
+     {NULL}
+#endif
+    },
+
+    {{"blake2s"}, 0,
+#ifdef HAVE_BLAKE2
+     {&EVP_blake2s256}
+#else
+     {NULL}
+#endif
+    },
+
+    /*==== End of list ==== */
+    {{NULL}, 0, {NULL}}
 };
 
 void init_digest_types(ErlNifEnv* env)

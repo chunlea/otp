@@ -1,7 +1,7 @@
 %%
 %% %CopyrightBegin%
 %%
-%% Copyright Ericsson AB 2007-2016. All Rights Reserved.
+%% Copyright Ericsson AB 2007-2020. All Rights Reserved.
 %%
 %% Licensed under the Apache License, Version 2.0 (the "License");
 %% you may not use this file except in compliance with the License.
@@ -38,17 +38,20 @@
 -define(ECDSA, 3).
 
 -record(session, {
-	  session_id,
-	  peer_certificate,
-	  own_certificate,
-	  compression_method,
-	  cipher_suite,
-	  master_secret,
-	  srp_username,
-	  is_resumable,
-	  time_stamp,
-	  ecc
-	  }).
+                  session_id,
+                  internal_id,
+                  peer_certificate,
+                  own_certificates,
+                  compression_method,
+                  cipher_suite,
+                  master_secret,
+                  srp_username,
+                  is_resumable,
+                  time_stamp,
+                  ecc,                   %% TLS 1.3 Group
+                  sign_alg,              %% TLS 1.3 Signature Algorithm
+                  dh_public_value        %% TLS 1.3 DH Public Value from peer
+                 }).
 
 -define(NUM_OF_SESSION_ID_BYTES, 32).  % TSL 1.1 & SSL 3
 -define(NUM_OF_PREMASTERSECRET_BYTES, 48).
@@ -374,7 +377,7 @@
 -define(NAMED_CURVE, 3).
 
 %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
-%% RFC 6066 Server name indication 
+%% RFC 6066 TLS Extensions: Extension Definitions
 %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
 
 %% section 3
@@ -387,12 +390,42 @@
           hostname = undefined
         }).
 
+%% enum{ 2^9(1), 2^10(2), 2^11(3), 2^12(4), (255) } MaxFragmentLength;
+-define(MAX_FRAGMENT_LENGTH_EXT, 1).
+-define(MAX_FRAGMENT_LENGTH_BYTES_1,  512).
+-define(MAX_FRAGMENT_LENGTH_BYTES_2, 1024).
+-define(MAX_FRAGMENT_LENGTH_BYTES_3, 2048).
+-define(MAX_FRAGMENT_LENGTH_BYTES_4, 4096).
+
+-record(max_frag_enum, {
+          enum = undefined  %% contains the enum value 1..4
+        }).
+
+%% Section 8, Certificate Status Request
+-define(STATUS_REQUEST, 5).
+-define(CERTIFICATE_STATUS_TYPE_OCSP, 1).
+-define(CERTIFICATE_STATUS, 22).
+
+%% status request record defined in RFC 6066, section 8
+-record(certificate_status_request, {
+	status_type,
+	request
+}).
+
+-record(ocsp_status_request, {
+	responder_id_list = [],
+	request_extensions = []
+}).
+
+-record(certificate_status, {
+	status_type,
+	response
+}).
+
 %% Other possible values from RFC 6066, not supported
--define(MAX_FRAGMENT_LENGTH, 1).
 -define(CLIENT_CERTIFICATE_URL, 2).
 -define(TRUSTED_CA_KEYS, 3).
 -define(TRUNCATED_HMAC, 4).
--define(STATUS_REQUEST, 5).
 
 %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
 %% RFC 7250 Using Raw Public Keys in Transport Layer Security (TLS)

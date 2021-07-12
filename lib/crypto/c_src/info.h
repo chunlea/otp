@@ -1,7 +1,7 @@
 /*
  * %CopyrightBegin%
  *
- * Copyright Ericsson AB 2010-2018. All Rights Reserved.
+ * Copyright Ericsson AB 2010-2020. All Rights Reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -26,7 +26,7 @@
 #ifdef HAVE_DYNAMIC_CRYPTO_LIB
 extern char *crypto_callback_name;
 
-int change_basename(ErlNifBinary* bin, char* buf, int bufsz, const char* newfile);
+int change_basename(ErlNifBinary* bin, char* buf, size_t bufsz, const char* newfile);
 void error_handler(void* null, const char* errstr);
 #endif
 

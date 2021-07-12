@@ -30,15 +30,11 @@ MODULES= \
 	erl_lint_SUITE \
 	erl_pp_SUITE \
 	erl_scan_SUITE \
+	error_info_lib \
 	error_logger_h_SUITE \
 	escript_SUITE \
 	ets_SUITE \
 	ets_tough_SUITE \
-	expand_test \
-	expand_test1 \
-	unicode_expand \
-	ExpandTestCaps \
-	ExpandTestCaps1 \
 	filelib_SUITE \
 	file_sorter_SUITE \
 	filename_SUITE \
@@ -55,7 +51,9 @@ MODULES= \
 	log_mf_h_SUITE \
 	math_SUITE \
 	ms_transform_SUITE \
+	pool_SUITE \
 	proc_lib_SUITE \
+	proplists_SUITE \
 	qlc_SUITE \
 	queue_SUITE \
 	rand_SUITE \
@@ -77,6 +75,7 @@ MODULES= \
 	supervisor_deadlock \
 	naughty_child \
 	shell_SUITE \
+	shell_docs_SUITE \
 	supervisor_SUITE \
 	supervisor_bridge_SUITE \
 	sys_SUITE \
@@ -148,7 +147,7 @@ release_spec: opt
 
 release_tests_spec: make_emakefile
 	$(INSTALL_DIR) "$(RELSYSDIR)"
-	$(INSTALL_DATA) stdlib.spec stdlib_bench.spec $(EMAKEFILE) \
+	$(INSTALL_DATA) stdlib.spec stdlib_bench.spec error_info.spec $(EMAKEFILE) \
 		$(ERL_FILES) $(COVERFILE) "$(RELSYSDIR)"
 	chmod -R u+w "$(RELSYSDIR)"
 	@tar cf - *_SUITE_data property_test | (cd "$(RELSYSDIR)"; tar xf -)

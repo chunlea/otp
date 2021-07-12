@@ -88,11 +88,12 @@ split_even(Rs) -> split_even(Rs, [], []).
 %%%
 %%% Local functions.
 %%%
-
 replace_labels_1([{test,Test,{f,Lbl},Ops}|Is], Acc, D, Fb) ->
-    replace_labels_1(Is, [{test,Test,{f,label(Lbl, D, Fb)},Ops}|Acc], D, Fb);
+    I = {test,Test,{f,label(Lbl, D, Fb)},Ops},
+    replace_labels_1(Is, [I | Acc], D, Fb);
 replace_labels_1([{test,Test,{f,Lbl},Live,Ops,Dst}|Is], Acc, D, Fb) ->
-    replace_labels_1(Is, [{test,Test,{f,label(Lbl, D, Fb)},Live,Ops,Dst}|Acc], D, Fb);
+    I = {test,Test,{f,label(Lbl, D, Fb)},Live,Ops,Dst},
+    replace_labels_1(Is, [I | Acc], D, Fb);
 replace_labels_1([{select,I,R,{f,Fail0},Vls0}|Is], Acc, D, Fb) ->
     Vls = map(fun ({f,L}) -> {f,label(L, D, Fb)};
 		   (Other) -> Other
@@ -113,10 +114,6 @@ replace_labels_1([{wait,{f,Lbl}}|Is], Acc, D, Fb) ->
     replace_labels_1(Is, [{wait,{f,label(Lbl, D, Fb)}}|Acc], D, Fb);
 replace_labels_1([{wait_timeout,{f,Lbl},To}|Is], Acc, D, Fb) ->
     replace_labels_1(Is, [{wait_timeout,{f,label(Lbl, D, Fb)},To}|Acc], D, Fb);
-replace_labels_1([{recv_mark=Op,{f,Lbl}}|Is], Acc, D, Fb) ->
-    replace_labels_1(Is, [{Op,{f,label(Lbl, D, Fb)}}|Acc], D, Fb);
-replace_labels_1([{recv_set=Op,{f,Lbl}}|Is], Acc, D, Fb) ->
-    replace_labels_1(Is, [{Op,{f,label(Lbl, D, Fb)}}|Acc], D, Fb);
 replace_labels_1([{bif,Name,{f,Lbl},As,R}|Is], Acc, D, Fb) when Lbl =/= 0 ->
     replace_labels_1(Is, [{bif,Name,{f,label(Lbl, D, Fb)},As,R}|Acc], D, Fb);
 replace_labels_1([{gc_bif,Name,{f,Lbl},Live,As,R}|Is], Acc, D, Fb) when Lbl =/= 0 ->
@@ -125,6 +122,8 @@ replace_labels_1([{call,Ar,{f,Lbl}}|Is], Acc, D, Fb) ->
     replace_labels_1(Is, [{call,Ar,{f,label(Lbl, D, Fb)}}|Acc], D, Fb);
 replace_labels_1([{make_fun2,{f,Lbl},U1,U2,U3}|Is], Acc, D, Fb) ->
     replace_labels_1(Is, [{make_fun2,{f,label(Lbl, D, Fb)},U1,U2,U3}|Acc], D, Fb);
+replace_labels_1([{make_fun3,{f,Lbl},U1,U2,U3,U4}|Is], Acc, D, Fb) ->
+    replace_labels_1(Is, [{make_fun3,{f,label(Lbl, D, Fb)},U1,U2,U3,U4}|Acc], D, Fb);
 replace_labels_1([{bs_init,{f,Lbl},Info,Live,Ss,Dst}|Is], Acc, D, Fb) when Lbl =/= 0 ->
     replace_labels_1(Is, [{bs_init,{f,label(Lbl, D, Fb)},Info,Live,Ss,Dst}|Acc], D, Fb);
 replace_labels_1([{bs_put,{f,Lbl},Info,Ss}|Is], Acc, D, Fb) when Lbl =/= 0 ->
@@ -134,6 +133,9 @@ replace_labels_1([{put_map=I,{f,Lbl},Op,Src,Dst,Live,List}|Is], Acc, D, Fb)
     replace_labels_1(Is, [{I,{f,label(Lbl, D, Fb)},Op,Src,Dst,Live,List}|Acc], D, Fb);
 replace_labels_1([{get_map_elements=I,{f,Lbl},Src,List}|Is], Acc, D, Fb) when Lbl =/= 0 ->
     replace_labels_1(Is, [{I,{f,label(Lbl, D, Fb)},Src,List}|Acc], D, Fb);
+replace_labels_1([{bs_start_match4,{f,Lbl},Live,Src,Dst}|Is], Acc, D, Fb) ->
+    I = {bs_start_match4,{f,label(Lbl, D, Fb)},Live,Src,Dst},
+    replace_labels_1(Is, [I | Acc], D, Fb);
 replace_labels_1([I|Is], Acc, D, Fb) ->
     replace_labels_1(Is, [I|Acc], D, Fb);
 replace_labels_1([], Acc, _, _) -> Acc.

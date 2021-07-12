@@ -1,7 +1,7 @@
 %%
 %% %CopyrightBegin%
 %%
-%% Copyright Ericsson AB 2018-2018. All Rights Reserved.
+%% Copyright Ericsson AB 2018-2020. All Rights Reserved.
 %%
 %% Licensed under the Apache License, Version 2.0 (the "License");
 %% you may not use this file except in compliance with the License.
@@ -74,29 +74,54 @@
           y                %     opaque Y[coordinate_length];
          }).
 
+%% RFC 8446 4.2.9.  Pre-Shared Key Exchange Modes
+
+%% enum { psk_ke(0), psk_dhe_ke(1), (255) } PskKeyExchangeMode;
 -define(PSK_KE, 0).
 -define(PSK_DHE_KE, 1).
 
--record(psk_keyexchange_modes, {
+-record(psk_key_exchange_modes, {
           ke_modes % ke_modes<1..255>
          }).
+
+%% RFC 8446 4.2.10.  Early Data Indication
 -record(empty, {
          }).
--record(early_data_indication, {
-          indication % uint32 max_early_data_size (new_session_ticket) | 
-          %% #empty{} (client_hello, encrypted_extensions)
+
+%% #empty{} (client_hello, encrypted_extensions)
+-record(early_data_indication, {}).
+-record(early_data_indication_nst, {
+          indication % uint32 max_early_data_size (new_session_ticket)
          }).
--record(psk_identity, {
-          identity, %     opaque identity<1..2^16-1>
-          obfuscated_ticket_age %  uint32
-         }).
--record(offered_psks, {
-          psk_identity,    %identities<7..2^16-1>;
-          psk_binder_entry %binders<33..2^16-1>,  opaque PskBinderEntry<32..255>
-         }).
--record(pre_shared_keyextension,{ 
-          extension %OfferedPsks (client_hello) | uint16 selected_identity (server_hello)
-         }).
+
+%% RFC 8446 4.2.11. Pre-Shared Key Extension
+-record(psk_identity,
+        {
+         identity,             % opaque identity<1..2^16-1>
+         obfuscated_ticket_age % uint32
+        }).
+
+-record(offered_psks,
+        {
+         identities,    % PskIdentity identities<7..2^16-1>;
+         binders        % PskBinderEntry binders<33..2^16-1>; opaque PskBinderEntry<32..255>
+        }).
+
+%% struct {
+%%     select (Handshake.msg_type) {
+%%         case client_hello: OfferedPsks;
+%%         case server_hello: uint16 selected_identity;
+%%     };
+%% } PreSharedKeyExtension;
+-record(pre_shared_key_client_hello,
+        {
+         offered_psks
+        }).
+
+-record(pre_shared_key_server_hello,
+        {
+         selected_identity
+        }).
 
 %% RFC 8446 B.3.1.2.
 -record(cookie, {
@@ -231,8 +256,11 @@
 -type tls_handshake_1_3() :: #encrypted_extensions{} |
                              #certificate_request_1_3{} |
                              #certificate_1_3{} |
-                             #certificate_verify_1_3{}.
+                             #certificate_verify_1_3{} |
+                             #new_session_ticket{} |
+                             #key_update{}.
 
 -export_type([tls_handshake_1_3/0]).
+
 
 -endif. % -ifdef(tls_handshake_1_3).

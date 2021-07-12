@@ -1,7 +1,7 @@
 %%
 %% %CopyrightBegin%
 %%
-%% Copyright Ericsson AB 2007-2018. All Rights Reserved.
+%% Copyright Ericsson AB 2007-2020. All Rights Reserved.
 %%
 %% Licensed under the Apache License, Version 2.0 (the "License");
 %% you may not use this file except in compliance with the License.
@@ -29,22 +29,53 @@
 -include("ssl_internal.hrl").
 -include("ssl_record.hrl").
 
--export([master_secret/4, finished/5, certificate_verify/3, mac_hash/7, hmac_hash/3,
-	 setup_keys/8, suites/1, prf/5,
-	 ecc_curves/1, ecc_curves/2, oid_to_enum/1, enum_to_oid/1, 
-	 default_signature_algs/1, signature_algs/2,
-         default_signature_schemes/1, signature_schemes/2,
-         groups/1, groups/2, group_to_enum/1, enum_to_group/1, default_groups/1]).
+-export([master_secret/4, 
+         finished/5, 
+         certificate_verify/3, 
+         mac_hash/7, 
+         hmac_hash/3,
+	 setup_keys/8, 
+         suites/1, 
+         exclusive_suites/1,
+         prf/5,
+	 ecc_curves/1, 
+         ecc_curves/2, 
+         oid_to_enum/1, 
+         enum_to_oid/1, 
+	 default_signature_algs/1, 
+         signature_algs/2,
+         default_signature_schemes/1, 
+         signature_schemes/2,
+         groups/1, 
+         groups/2, 
+         group_to_enum/1, 
+         enum_to_group/1, 
+         default_groups/1]).
 
--export([derive_secret/4, hkdf_expand_label/5, hkdf_extract/3, hkdf_expand/4,
-         key_schedule/3, key_schedule/4, create_info/3,
-         external_binder_key/2, resumption_binder_key/2,
-         client_early_traffic_secret/3, early_exporter_master_secret/3,
-         client_handshake_traffic_secret/3, server_handshake_traffic_secret/3,
-         client_application_traffic_secret_0/3, server_application_traffic_secret_0/3,
-         exporter_master_secret/3, resumption_master_secret/3,
-         update_traffic_secret/2, calculate_traffic_keys/3,
-         transcript_hash/2, finished_key/2, finished_verify_data/3]).
+-export([derive_secret/4, 
+         hkdf_expand_label/5, 
+         hkdf_extract/3, 
+         hkdf_expand/4,
+         key_length/1,
+         key_schedule/3, 
+         key_schedule/4, 
+         create_info/3,
+         external_binder_key/2, 
+         resumption_binder_key/2,
+         client_early_traffic_secret/3, 
+         early_exporter_master_secret/3,
+         client_handshake_traffic_secret/3, 
+         server_handshake_traffic_secret/3,
+         client_application_traffic_secret_0/3, 
+         server_application_traffic_secret_0/3,
+         exporter_master_secret/3, 
+         resumption_master_secret/3,
+         update_traffic_secret/2, 
+         calculate_traffic_keys/3,
+         transcript_hash/2, 
+         finished_key/2, 
+         finished_verify_data/3, 
+         pre_shared_key/3]).
 
 -type named_curve() :: sect571r1 | sect571k1 | secp521r1 | brainpoolP512r1 |
                        sect409k1 | sect409r1 | brainpoolP384r1 | secp384r1 |
@@ -64,7 +95,7 @@
 
 %% TLS 1.3 ---------------------------------------------------
 -spec derive_secret(Secret::binary(), Label::binary(),
-                    Messages::iodata(), Algo::ssl_cipher_format:hash()) -> Key::binary().
+                    Messages::iodata(), Algo::ssl:hash()) -> Key::binary().
 derive_secret(Secret, Label, Messages, Algo) ->
     Hash = crypto:hash(mac_algo(Algo), Messages),
     hkdf_expand_label(Secret, Label,
@@ -72,7 +103,7 @@ derive_secret(Secret, Label, Messages, Algo) ->
 
 -spec hkdf_expand_label(Secret::binary(), Label0::binary(),
                         Context::binary(), Length::integer(),  
-                        Algo::ssl_cipher_format:hash()) -> KeyingMaterial::binary().
+                        Algo::ssl:hash()) -> KeyingMaterial::binary().
 hkdf_expand_label(Secret, Label0, Context, Length, Algo) ->
     HkdfLabel = create_info(Label0, Context, Length),
     hkdf_expand(Secret, HkdfLabel, Length, Algo).
@@ -93,7 +124,7 @@ create_info(Label0, Context0, Length) ->
     Content = <<Label/binary, Context/binary>>,
     <<?UINT16(Length), Content/binary>>.
 
--spec hkdf_extract(MacAlg::ssl_cipher_format:hash(), Salt::binary(), 
+-spec hkdf_extract(MacAlg::ssl:hash(), Salt::binary(),
                    KeyingMaterial::binary()) -> PseudoRandKey::binary().
 
 hkdf_extract(MacAlg, Salt, KeyingMaterial) -> 
@@ -101,14 +132,14 @@ hkdf_extract(MacAlg, Salt, KeyingMaterial) ->
 
 
 -spec hkdf_expand(PseudoRandKey::binary(), ContextInfo::binary(),
-                  Length::integer(), Algo::ssl_cipher_format:hash()) -> KeyingMaterial::binary().
+                  Length::integer(), Algo::ssl:hash()) -> KeyingMaterial::binary().
                      
 hkdf_expand(PseudoRandKey, ContextInfo, Length, Algo) -> 
     Iterations = erlang:ceil(Length / ssl_cipher:hash_size(Algo)),
     hkdf_expand(Algo, PseudoRandKey, ContextInfo, Length, 1, Iterations, <<>>, <<>>).
 
 
--spec transcript_hash(Messages::iodata(),  Algo::ssl_cipher_format:hash()) -> Hash::binary().
+-spec transcript_hash(Messages::iodata(),  Algo::ssl:hash()) -> Hash::binary().
 
 transcript_hash(Messages, Algo) ->
      crypto:hash(mac_algo(Algo), Messages).
@@ -393,6 +424,15 @@ finished_verify_data(FinishedKey, HKDFAlgo, Messages) ->
     THash = tls_v1:transcript_hash(Context, HKDFAlgo),
     tls_v1:hmac_hash(HKDFAlgo, FinishedKey, THash).
 
+-spec pre_shared_key(binary(), binary(), atom()) -> binary().
+pre_shared_key(RMS, Nonce, Algo) ->
+    %% The PSK associated with the ticket is computed as:
+    %%
+    %%     HKDF-Expand-Label(resumption_master_secret,
+    %%                      "resumption", ticket_nonce, Hash.length)
+    ssl_cipher:hash_size(Algo),
+    hkdf_expand_label(RMS, <<"resumption">>, Nonce, ssl_cipher:hash_size(Algo), Algo).
+
 %% The next-generation application_traffic_secret is computed as:
 %%
 %%        application_traffic_secret_N+1 =
@@ -416,12 +456,19 @@ update_traffic_secret(Algo, Secret) ->
 %%
 %%    [sender]_write_key = HKDF-Expand-Label(Secret, "key", "", key_length)
 %%    [sender]_write_iv  = HKDF-Expand-Label(Secret, "iv", "", iv_length)
--spec calculate_traffic_keys(atom(), atom(), binary()) -> {binary(), binary()}.
-calculate_traffic_keys(HKDFAlgo, Cipher, Secret) ->
-    Key = hkdf_expand_label(Secret, <<"key">>, <<>>, ssl_cipher:key_material(Cipher), HKDFAlgo),
+-spec calculate_traffic_keys(atom(), integer(), binary()) -> {binary(), binary()}.
+calculate_traffic_keys(HKDFAlgo, KeyLength, Secret) ->
+    Key = hkdf_expand_label(Secret, <<"key">>, <<>>, KeyLength, HKDFAlgo),
     %% TODO: remove hard coded IV size
     IV = hkdf_expand_label(Secret, <<"iv">>, <<>>, 12, HKDFAlgo),
     {Key, IV}.
+
+-spec key_length(CipherSuite) -> KeyLength when
+      CipherSuite :: binary(),
+      KeyLength :: 0 | 8 | 16 | 24 | 32.
+key_length(CipherSuite) ->
+    #{cipher := Cipher} = ssl_cipher_format:suite_bin_to_map(CipherSuite),
+    ssl_cipher:key_material(Cipher).
 
 %% TLS v1.3  ---------------------------------------------------
 
@@ -444,50 +491,68 @@ mac_hash(Method, Mac_write_secret, Seq_num, Type, {Major, Minor},
 
 %% TODO 1.3 same as above?
 
--spec suites(1|2|3|4|'TLS_v1.3') -> [ssl_cipher_format:cipher_suite()].
+-spec suites(1|2|3|4) -> [ssl_cipher_format:cipher_suite()].
 
 suites(Minor) when Minor == 1; Minor == 2 ->
-    [
-      ?TLS_ECDHE_ECDSA_WITH_AES_256_CBC_SHA,
-      ?TLS_ECDHE_RSA_WITH_AES_256_CBC_SHA,
-      ?TLS_DHE_RSA_WITH_AES_256_CBC_SHA,
-      ?TLS_DHE_DSS_WITH_AES_256_CBC_SHA,
-      ?TLS_ECDH_ECDSA_WITH_AES_256_CBC_SHA,
-      ?TLS_ECDH_RSA_WITH_AES_256_CBC_SHA,
-
-      ?TLS_ECDHE_ECDSA_WITH_AES_128_CBC_SHA,
-      ?TLS_ECDHE_RSA_WITH_AES_128_CBC_SHA,
-      ?TLS_DHE_RSA_WITH_AES_128_CBC_SHA,
-      ?TLS_DHE_DSS_WITH_AES_128_CBC_SHA,
-      ?TLS_ECDH_ECDSA_WITH_AES_128_CBC_SHA,
-      ?TLS_ECDH_RSA_WITH_AES_128_CBC_SHA
-    ];
+    exclusive_suites(2);
 suites(3) ->
+    exclusive_suites(3) ++ suites(2);
+
+suites(4) ->
+    exclusive_suites(4) ++ suites(3).
+
+exclusive_suites(4) ->
+    [?TLS_AES_256_GCM_SHA384,
+     ?TLS_AES_128_GCM_SHA256,
+     ?TLS_CHACHA20_POLY1305_SHA256,
+     ?TLS_AES_128_CCM_SHA256,
+     ?TLS_AES_128_CCM_8_SHA256
+    ];
+exclusive_suites(3) ->
     [?TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384,
      ?TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384,
+
+     ?TLS_ECDHE_ECDSA_WITH_AES_256_CCM,
+     ?TLS_ECDHE_ECDSA_WITH_AES_256_CCM_8,
+
      ?TLS_ECDHE_ECDSA_WITH_AES_256_CBC_SHA384,
      ?TLS_ECDHE_RSA_WITH_AES_256_CBC_SHA384,
-     ?TLS_ECDH_ECDSA_WITH_AES_256_GCM_SHA384,
-     ?TLS_ECDH_RSA_WITH_AES_256_GCM_SHA384,
-     ?TLS_ECDH_ECDSA_WITH_AES_256_CBC_SHA384,
-     ?TLS_ECDH_RSA_WITH_AES_256_CBC_SHA384,
 
-     ?TLS_DHE_RSA_WITH_AES_256_GCM_SHA384,
-     ?TLS_DHE_DSS_WITH_AES_256_GCM_SHA384,
-     ?TLS_DHE_RSA_WITH_AES_256_CBC_SHA256,
-     ?TLS_DHE_DSS_WITH_AES_256_CBC_SHA256,
+     ?TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256,
+     ?TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256,
 
      ?TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256,
      ?TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256,
-     ?TLS_ECDHE_ECDSA_WITH_AES_128_CBC_SHA256,
-     ?TLS_ECDHE_RSA_WITH_AES_128_CBC_SHA256,
+
+     ?TLS_ECDHE_ECDSA_WITH_AES_128_CCM,
+     ?TLS_ECDHE_ECDSA_WITH_AES_128_CCM_8,
+
+     ?TLS_ECDH_ECDSA_WITH_AES_256_GCM_SHA384,
+     ?TLS_ECDH_RSA_WITH_AES_256_GCM_SHA384,
+
+     ?TLS_ECDH_ECDSA_WITH_AES_256_CBC_SHA384,
+     ?TLS_ECDH_RSA_WITH_AES_256_CBC_SHA384,
+
      ?TLS_ECDH_ECDSA_WITH_AES_128_GCM_SHA256,
      ?TLS_ECDH_RSA_WITH_AES_128_GCM_SHA256,
+
+     ?TLS_ECDHE_ECDSA_WITH_AES_128_CBC_SHA256,
+     ?TLS_ECDHE_RSA_WITH_AES_128_CBC_SHA256,
+
      ?TLS_ECDH_ECDSA_WITH_AES_128_CBC_SHA256,
      ?TLS_ECDH_RSA_WITH_AES_128_CBC_SHA256,
 
+     ?TLS_DHE_RSA_WITH_AES_256_GCM_SHA384,
+     ?TLS_DHE_DSS_WITH_AES_256_GCM_SHA384,
+
+     ?TLS_DHE_RSA_WITH_AES_256_CBC_SHA256,
+     ?TLS_DHE_DSS_WITH_AES_256_CBC_SHA256,
+    
      ?TLS_DHE_RSA_WITH_AES_128_GCM_SHA256,
      ?TLS_DHE_DSS_WITH_AES_128_GCM_SHA256,
+     
+     ?TLS_DHE_RSA_WITH_CHACHA20_POLY1305_SHA256,
+     
      ?TLS_DHE_RSA_WITH_AES_128_CBC_SHA256,
      ?TLS_DHE_DSS_WITH_AES_128_CBC_SHA256
 
@@ -496,26 +561,23 @@ suites(3) ->
      %% ?TLS_DH_DSS_WITH_AES_256_GCM_SHA384,
      %% ?TLS_DH_RSA_WITH_AES_128_GCM_SHA256,
      %% ?TLS_DH_DSS_WITH_AES_128_GCM_SHA256
-    ] ++ suites(2);
-
-suites(4) ->
-    [?TLS_AES_256_GCM_SHA384,
-     ?TLS_AES_128_GCM_SHA256,
-     ?TLS_CHACHA20_POLY1305_SHA256
-     %% Not supported
-     %% ?TLS_AES_128_CCM_SHA256,
-     %% ?TLS_AES_128_CCM_8_SHA256
-    ] ++ suites(3);
-
-suites('TLS_v1.3') ->
-    [?TLS_AES_256_GCM_SHA384,
-     ?TLS_AES_128_GCM_SHA256,
-     ?TLS_CHACHA20_POLY1305_SHA256
-     %% Not supported
-     %% ?TLS_AES_128_CCM_SHA256,
-     %% ?TLS_AES_128_CCM_8_SHA256
+    ];
+exclusive_suites(Minor) when Minor == 1; Minor == 2 ->
+    [
+     ?TLS_ECDHE_ECDSA_WITH_AES_256_CBC_SHA,
+     ?TLS_ECDHE_RSA_WITH_AES_256_CBC_SHA,
+     ?TLS_DHE_RSA_WITH_AES_256_CBC_SHA,
+     ?TLS_DHE_DSS_WITH_AES_256_CBC_SHA,
+     ?TLS_ECDH_ECDSA_WITH_AES_256_CBC_SHA,
+     ?TLS_ECDH_RSA_WITH_AES_256_CBC_SHA,
+     
+     ?TLS_ECDHE_ECDSA_WITH_AES_128_CBC_SHA,
+     ?TLS_ECDHE_RSA_WITH_AES_128_CBC_SHA,
+     ?TLS_DHE_RSA_WITH_AES_128_CBC_SHA,
+     ?TLS_DHE_DSS_WITH_AES_128_CBC_SHA,
+     ?TLS_ECDH_ECDSA_WITH_AES_128_CBC_SHA,
+     ?TLS_ECDH_RSA_WITH_AES_128_CBC_SHA
     ].
-
 
 signature_algs({3, 4}, HashSigns) ->
     signature_algs({3, 3}, HashSigns);
@@ -595,10 +657,14 @@ signature_schemes(Version, SignatureSchemes) when is_tuple(Version)
                              H -> H
                          end,
                   case proplists:get_bool(Sign, PubKeys)
-                      andalso proplists:get_bool(Hash, Hashes)
-                      andalso (Curve =:= undefined orelse
-                               proplists:get_bool(Curve, Curves))
-                      andalso is_pair(Hash, Sign, Hashes)
+                      andalso
+                      (proplists:get_bool(Hash, Hashes)
+                       andalso (Curve =:= undefined orelse
+                                proplists:get_bool(Curve, Curves))
+                       andalso is_pair(Hash, Sign, Hashes)) orelse
+                      ((Sign == eddsa) andalso ((Curve == ed448)
+                                                orelse
+                                                (Curve == ed25519)))
                   of
                       true ->
                           [Scheme | Acc];
@@ -606,8 +672,26 @@ signature_schemes(Version, SignatureSchemes) when is_tuple(Version)
                           Acc
                   end;
               %% Special clause for filtering out the legacy hash-sign tuples.
-              (_ , Acc) ->
-                  Acc
+              ({Hash, dsa = Sign} = Alg, Acc) ->
+                  case proplists:get_bool(dss, PubKeys)
+                      andalso proplists:get_bool(Hash, Hashes)
+                      andalso is_pair(Hash, Sign, Hashes)
+                  of
+                      true ->
+                          [Alg | Acc];
+                      false ->
+                          Acc
+                  end;
+              ({Hash, Sign} = Alg, Acc) ->
+                  case proplists:get_bool(Sign, PubKeys)
+                      andalso proplists:get_bool(Hash, Hashes)
+                      andalso is_pair(Hash, Sign, Hashes)
+                  of
+                      true ->
+                          [Alg | Acc];
+                      false ->
+                          Acc
+                  end
           end,
     Supported = lists:foldl(Fun, [], SignatureSchemes),
     lists:reverse(Supported);
@@ -625,8 +709,8 @@ default_signature_schemes(Version) ->
                rsa_pss_rsae_sha512,
                rsa_pss_rsae_sha384,
                rsa_pss_rsae_sha256,
-               %% ed25519,
-               %% ed448,
+               eddsa_ed25519,
+               eddsa_ed448,
 
                %% These values refer solely to signatures
                %% which appear in certificates (see Section 4.4.2.2) and are not
@@ -657,7 +741,7 @@ hkdf_expand(Algo, PseudoRandKey, ContextInfo, Length, M, N, Prev, Acc) ->
 hmac_hash(?NULL, _, _) ->
     <<>>;
 hmac_hash(Alg, Key, Value) ->
-    crypto:hmac(mac_algo(Alg), Key, Value).
+    crypto:mac(hmac, mac_algo(Alg), Key, Value).
 
 mac_algo(Alg) when is_atom(Alg) -> 
     Alg;
@@ -745,7 +829,9 @@ is_pair(Hash, ecdsa, Hashs) ->
     lists:member(Hash, AtLeastSha);
 is_pair(Hash, rsa, Hashs) ->
     AtLeastMd5 = Hashs -- [md2,md4],
-    lists:member(Hash, AtLeastMd5).
+    lists:member(Hash, AtLeastMd5);
+is_pair(_,_,_) ->
+    false.
 
 %% list ECC curves in preferred order
 -spec ecc_curves(1..3 | all) -> [named_curve()].
@@ -857,7 +943,9 @@ oid_to_enum(?secp384r1) -> 24;
 oid_to_enum(?secp521r1) -> 25;
 oid_to_enum(?brainpoolP256r1) -> 26;
 oid_to_enum(?brainpoolP384r1) -> 27;
-oid_to_enum(?brainpoolP512r1) -> 28.
+oid_to_enum(?brainpoolP512r1) -> 28;
+oid_to_enum(?'id-X25519') -> 29;
+oid_to_enum(?'id-X448') -> 30.
 
 enum_to_oid(1) -> ?sect163k1;
 enum_to_oid(2) -> ?sect163r1;
@@ -887,5 +975,7 @@ enum_to_oid(25) -> ?secp521r1;
 enum_to_oid(26) -> ?brainpoolP256r1;
 enum_to_oid(27) -> ?brainpoolP384r1;
 enum_to_oid(28) -> ?brainpoolP512r1;
+enum_to_oid(29) -> ?'id-X25519';
+enum_to_oid(30) -> ?'id-X448';
 enum_to_oid(_) ->
     undefined.

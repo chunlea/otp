@@ -1,7 +1,7 @@
 /*
  * %CopyrightBegin%
  *
- * Copyright Ericsson AB 2010-2018. All Rights Reserved.
+ * Copyright Ericsson AB 2010-2020. All Rights Reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -20,98 +20,342 @@
 
 #include "cipher.h"
 
-#ifdef OPENSSL_NO_DES
-#define COND_NO_DES_PTR(Ptr) (NULL)
-#else
+#ifdef HAVE_DES
 #define COND_NO_DES_PTR(Ptr) (Ptr)
+#else
+#define COND_NO_DES_PTR(Ptr) (NULL)
 #endif
+
+#define NOT_AEAD {{0,0,0}}
 
 static struct cipher_type_t cipher_types[] =
 {
-    {{"rc2_cbc"},
-#ifndef OPENSSL_NO_RC2
-     {&EVP_rc2_cbc}
+#ifdef HAVE_RC2
+    {{"rc2_cbc"}, {&EVP_rc2_cbc}, 0, NO_FIPS_CIPHER, NOT_AEAD},
 #else
-     {NULL}
+    {{"rc2_cbc"}, {NULL}, 0, NO_FIPS_CIPHER, NOT_AEAD},
 #endif
-    },
-    {{"des_cbc"}, {COND_NO_DES_PTR(&EVP_des_cbc)}},
-    {{"des_cfb"}, {COND_NO_DES_PTR(&EVP_des_cfb8)}},
-    {{"des_ecb"}, {COND_NO_DES_PTR(&EVP_des_ecb)}},
-    {{"des_ede3_cbc"}, {COND_NO_DES_PTR(&EVP_des_ede3_cbc)}},
-    {{"des_ede3_cbf"}, /* Misspelled, retained */
+#ifdef HAVE_RC4
+    {{"rc4"},     {&EVP_rc4}, 0, NO_FIPS_CIPHER, NOT_AEAD},
+#else
+    {{"rc4"},     {NULL}, 0, NO_FIPS_CIPHER, NOT_AEAD},
+#endif
+    {{"des_cbc"}, {COND_NO_DES_PTR(&EVP_des_cbc)}, 0, NO_FIPS_CIPHER, NOT_AEAD},
+    {{"des_cfb"}, {COND_NO_DES_PTR(&EVP_des_cfb8)}, 0, NO_FIPS_CIPHER, NOT_AEAD},
+    {{"des_ecb"}, {COND_NO_DES_PTR(&EVP_des_ecb)}, 0, NO_FIPS_CIPHER | ECB_BUG_0_9_8L, NOT_AEAD},
+
+    {{"des_ede3_cbc"}, {COND_NO_DES_PTR(&EVP_des_ede3_cbc)}, 0, 0, NOT_AEAD},
+
 #ifdef HAVE_DES_ede3_cfb_encrypt
-     {COND_NO_DES_PTR(&EVP_des_ede3_cfb8)}
+    {{"des_ede3_cfb"}, {COND_NO_DES_PTR(&EVP_des_ede3_cfb8)}, 0, 0, NOT_AEAD},
 #else
-     {NULL}
+    {{"des_ede3_cfb"}, {NULL}, 0, 0, NOT_AEAD},
 #endif
-    },
-    {{"des_ede3_cfb"},
-#ifdef HAVE_DES_ede3_cfb_encrypt
-     {COND_NO_DES_PTR(&EVP_des_ede3_cfb8)}
+
+#ifdef HAVE_BF
+    {{"blowfish_cbc"}, {&EVP_bf_cbc}, 0, NO_FIPS_CIPHER, NOT_AEAD},
+    {{"blowfish_cfb64"}, {&EVP_bf_cfb64}, 0, NO_FIPS_CIPHER, NOT_AEAD},
+    {{"blowfish_ofb64"}, {&EVP_bf_ofb}, 0, NO_FIPS_CIPHER, NOT_AEAD},
+    {{"blowfish_ecb"}, {&EVP_bf_ecb}, 0, NO_FIPS_CIPHER | ECB_BUG_0_9_8L, NOT_AEAD},
 #else
-     {NULL}
+    {{"blowfish_cbc"}, {NULL}, 0, 0, NOT_AEAD},
+    {{"blowfish_cfb64"}, {NULL}, 0, 0, NOT_AEAD},
+    {{"blowfish_ofb64"}, {NULL}, 0, 0, NOT_AEAD},
+    {{"blowfish_ecb"}, {NULL}, 0, 0, NOT_AEAD},
 #endif
-    },
-    {{"blowfish_cbc"}, {&EVP_bf_cbc}},
-    {{"blowfish_cfb64"}, {&EVP_bf_cfb64}},
-    {{"blowfish_ofb64"}, {&EVP_bf_ofb}},
-    {{"blowfish_ecb"}, {&EVP_bf_ecb}},
-    {{"aes_cbc"}, {&EVP_aes_128_cbc}, 16},
-    {{"aes_cbc"}, {&EVP_aes_192_cbc}, 24},
-    {{"aes_cbc"}, {&EVP_aes_256_cbc}, 32},
-    {{"aes_cbc128"}, {&EVP_aes_128_cbc}},
-    {{"aes_cbc256"}, {&EVP_aes_256_cbc}},
-    {{"aes_cfb8"}, {&EVP_aes_128_cfb8}},
-    {{"aes_cfb128"}, {&EVP_aes_128_cfb128}},
-    {{"aes_ecb"}, {&EVP_aes_128_ecb}, 16},
-    {{"aes_ecb"}, {&EVP_aes_192_ecb}, 24},
-    {{"aes_ecb"}, {&EVP_aes_256_ecb}, 32},
-    {{NULL}}
+
+    {{"aes_128_cbc"}, {&EVP_aes_128_cbc}, 16, 0, NOT_AEAD},
+    {{"aes_192_cbc"}, {&EVP_aes_192_cbc}, 24, 0, NOT_AEAD},
+    {{"aes_256_cbc"}, {&EVP_aes_256_cbc}, 32, 0, NOT_AEAD},
+
+    {{"aes_128_cfb8"}, {&EVP_aes_128_cfb8}, 16, AES_CFBx, NOT_AEAD},
+    {{"aes_192_cfb8"}, {&EVP_aes_192_cfb8}, 24, AES_CFBx, NOT_AEAD},
+    {{"aes_256_cfb8"}, {&EVP_aes_256_cfb8}, 32, AES_CFBx, NOT_AEAD},
+
+    {{"aes_128_cfb128"}, {&EVP_aes_128_cfb128}, 16, AES_CFBx, NOT_AEAD},
+    {{"aes_192_cfb128"}, {&EVP_aes_192_cfb128}, 24, AES_CFBx, NOT_AEAD},
+    {{"aes_256_cfb128"}, {&EVP_aes_256_cfb128}, 32, AES_CFBx, NOT_AEAD},
+
+    {{"aes_128_ecb"}, {&EVP_aes_128_ecb}, 16, ECB_BUG_0_9_8L, NOT_AEAD},
+    {{"aes_192_ecb"}, {&EVP_aes_192_ecb}, 24, ECB_BUG_0_9_8L, NOT_AEAD},
+    {{"aes_256_ecb"}, {&EVP_aes_256_ecb}, 32, ECB_BUG_0_9_8L, NOT_AEAD},
+
+#if defined(HAVE_EVP_AES_CTR)
+    {{"aes_128_ctr"}, {&EVP_aes_128_ctr}, 16, 0, NOT_AEAD},
+    {{"aes_192_ctr"}, {&EVP_aes_192_ctr}, 24, 0, NOT_AEAD},
+    {{"aes_256_ctr"}, {&EVP_aes_256_ctr}, 32, 0, NOT_AEAD},
+#else
+    {{"aes_128_ctr"}, {NULL}, 16, AES_CTR_COMPAT, NOT_AEAD},
+    {{"aes_192_ctr"}, {NULL}, 24, AES_CTR_COMPAT, NOT_AEAD},
+    {{"aes_256_ctr"}, {NULL}, 32, AES_CTR_COMPAT, NOT_AEAD},
+#endif
+
+#if defined(HAVE_CHACHA20)
+    {{"chacha20"}, {&EVP_chacha20}, 32, NO_FIPS_CIPHER, NOT_AEAD},
+#else
+    {{"chacha20"}, {NULL}, 0, NO_FIPS_CIPHER, NOT_AEAD},
+#endif
+
+    /*==== AEAD ciphers ====*/
+#if defined(HAVE_CHACHA20_POLY1305)
+    {{"chacha20_poly1305"}, {&EVP_chacha20_poly1305}, 0, NO_FIPS_CIPHER | AEAD_CIPHER, {{EVP_CTRL_AEAD_SET_IVLEN,EVP_CTRL_AEAD_GET_TAG,EVP_CTRL_AEAD_SET_TAG}}},
+#else
+    {{"chacha20_poly1305"}, {NULL}, 0, NO_FIPS_CIPHER | AEAD_CIPHER, {{0,0,0}}},
+#endif
+
+#if defined(HAVE_GCM)
+    {{"aes_128_gcm"}, {&EVP_aes_128_gcm}, 16, AEAD_CIPHER|GCM_MODE, {{EVP_CTRL_GCM_SET_IVLEN,EVP_CTRL_GCM_GET_TAG,EVP_CTRL_GCM_SET_TAG}}},
+    {{"aes_192_gcm"}, {&EVP_aes_192_gcm}, 24, AEAD_CIPHER|GCM_MODE, {{EVP_CTRL_GCM_SET_IVLEN,EVP_CTRL_GCM_GET_TAG,EVP_CTRL_GCM_SET_TAG}}},
+    {{"aes_256_gcm"}, {&EVP_aes_256_gcm}, 32, AEAD_CIPHER|GCM_MODE, {{EVP_CTRL_GCM_SET_IVLEN,EVP_CTRL_GCM_GET_TAG,EVP_CTRL_GCM_SET_TAG}}},
+#else
+    {{"aes_128_gcm"}, {NULL}, 16, AEAD_CIPHER|GCM_MODE, {{0,0,0}}},
+    {{"aes_192_gcm"}, {NULL}, 24, AEAD_CIPHER|GCM_MODE, {{0,0,0}}},
+    {{"aes_256_gcm"}, {NULL}, 32, AEAD_CIPHER|GCM_MODE, {{0,0,0}}},
+#endif
+
+#if defined(HAVE_CCM)
+    {{"aes_128_ccm"}, {&EVP_aes_128_ccm}, 16, AEAD_CIPHER|CCM_MODE, {{EVP_CTRL_CCM_SET_IVLEN,EVP_CTRL_CCM_GET_TAG,EVP_CTRL_CCM_SET_TAG}}},
+    {{"aes_192_ccm"}, {&EVP_aes_192_ccm}, 24, AEAD_CIPHER|CCM_MODE, {{EVP_CTRL_CCM_SET_IVLEN,EVP_CTRL_CCM_GET_TAG,EVP_CTRL_CCM_SET_TAG}}},
+    {{"aes_256_ccm"}, {&EVP_aes_256_ccm}, 32, AEAD_CIPHER|CCM_MODE, {{EVP_CTRL_CCM_SET_IVLEN,EVP_CTRL_CCM_GET_TAG,EVP_CTRL_CCM_SET_TAG}}},
+#else
+    {{"aes_128_ccm"}, {NULL}, 16, AEAD_CIPHER|CCM_MODE, {{0,0,0}}},
+    {{"aes_192_ccm"}, {NULL}, 24, AEAD_CIPHER|CCM_MODE, {{0,0,0}}},
+    {{"aes_256_ccm"}, {NULL}, 32, AEAD_CIPHER|CCM_MODE, {{0,0,0}}},
+#endif
+
+    /*==== End of list ==== */
+
+    {{NULL},{NULL},0,0,NOT_AEAD}
 };
 
-#ifdef HAVE_EVP_AES_CTR
 ErlNifResourceType* evp_cipher_ctx_rtype;
 
+static size_t num_cipher_types = 0;
+
 static void evp_cipher_ctx_dtor(ErlNifEnv* env, struct evp_cipher_ctx* ctx) {
-    EVP_CIPHER_CTX_free(ctx->ctx);
-}
+    if (ctx == NULL)
+        return;
+
+    if (ctx->ctx)
+        EVP_CIPHER_CTX_free(ctx->ctx);
+
+#if !defined(HAVE_EVP_AES_CTR)
+    if (ctx->env)
+        enif_free_env(ctx->env);
 #endif
+}
 
 int init_cipher_ctx(ErlNifEnv *env) {
-#ifdef HAVE_EVP_AES_CTR
     evp_cipher_ctx_rtype = enif_open_resource_type(env, NULL, "EVP_CIPHER_CTX",
                                                    (ErlNifResourceDtor*) evp_cipher_ctx_dtor,
                                                    ERL_NIF_RT_CREATE|ERL_NIF_RT_TAKEOVER,
                                                    NULL);
-    if (evp_cipher_ctx_rtype == NULL) {
-        PRINTF_ERR0("CRYPTO: Could not open resource type 'EVP_CIPHER_CTX'");
-        return 0;
-    }
-#endif
+    if (evp_cipher_ctx_rtype == NULL)
+        goto err;
 
     return 1;
+
+ err:
+    PRINTF_ERR0("CRYPTO: Could not open resource type 'EVP_CIPHER_CTX'");
+    return 0;
 }
 
 void init_cipher_types(ErlNifEnv* env)
 {
     struct cipher_type_t* p = cipher_types;
 
+    num_cipher_types = 0;
     for (p = cipher_types; p->type.str; p++) {
+        num_cipher_types++;
 	p->type.atom = enif_make_atom(env, p->type.str);
 	if (p->cipher.funcp)
 	    p->cipher.p = p->cipher.funcp();
     }
     p->type.atom = atom_false; /* end marker */
+
+    qsort(cipher_types, num_cipher_types, sizeof(cipher_types[0]), cmp_cipher_types);
 }
 
-struct cipher_type_t* get_cipher_type(ERL_NIF_TERM type, size_t key_len)
+const struct cipher_type_t* get_cipher_type(ERL_NIF_TERM type, size_t key_len)
 {
-    struct cipher_type_t* p = NULL;
-    for (p = cipher_types; p->type.atom != atom_false; p++) {
-	if (type == p->type.atom && (!p->key_len || key_len == p->key_len)) {
-	    return p;
-	}
+    struct cipher_type_t key;
+
+    key.type.atom = type;
+    key.key_len = key_len;
+
+    return bsearch(&key, cipher_types, num_cipher_types, sizeof(cipher_types[0]), cmp_cipher_types);
+}
+
+
+int cmp_cipher_types(const void *keyp, const void *elemp) {
+    const struct cipher_type_t *key  = keyp;
+    const struct cipher_type_t *elem = elemp;
+
+    if (key->type.atom < elem->type.atom) return -1;
+    else if (key->type.atom > elem->type.atom) return 1;
+    else /* key->type.atom == elem->type.atom */
+        if (!elem->key_len || key->key_len == elem->key_len) return 0;
+        else if (key->key_len < elem->key_len) return -1;
+        else return 1;
+}
+
+
+ERL_NIF_TERM cipher_info_nif(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[])
+{/* (Type) */
+    const struct cipher_type_t *cipherp;
+    const EVP_CIPHER     *cipher;
+    ERL_NIF_TERM         ret, ret_mode;
+    unsigned             type;
+    unsigned long        mode;
+
+    if ((cipherp = get_cipher_type_no_key(argv[0])) == NULL)
+        return enif_make_badarg(env);
+
+    if (CIPHER_FORBIDDEN_IN_FIPS(cipherp))
+        return enif_raise_exception(env, atom_notsup);
+    if ((cipher = cipherp->cipher.p) == NULL)
+        return enif_raise_exception(env, atom_notsup);
+
+    ret = enif_make_new_map(env);
+
+    type = EVP_CIPHER_type(cipher);
+    enif_make_map_put(env, ret, atom_type,
+        type == NID_undef ? atom_undefined : enif_make_int(env, type),
+        &ret);
+
+    enif_make_map_put(env, ret, atom_key_length,
+        enif_make_int(env, EVP_CIPHER_key_length(cipher)), &ret);
+    enif_make_map_put(env, ret, atom_iv_length,
+        enif_make_int(env, EVP_CIPHER_iv_length(cipher)), &ret);
+    enif_make_map_put(env, ret, atom_block_size,
+        enif_make_int(env, EVP_CIPHER_block_size(cipher)), &ret);
+    enif_make_map_put(env, ret, atom_prop_aead, 
+#if defined(HAVE_AEAD)
+            (((EVP_CIPHER_flags(cipher) & EVP_CIPH_FLAG_AEAD_CIPHER) != 0) ? atom_true : atom_false), 
+#else
+            atom_false,
+#endif
+            &ret);
+
+    mode = EVP_CIPHER_mode(cipher);
+    switch (mode) {
+        case EVP_CIPH_ECB_MODE:
+            ret_mode = atom_ecb_mode;
+            break;
+
+        case EVP_CIPH_CBC_MODE:
+            ret_mode = atom_cbc_mode;
+            break;
+
+        case EVP_CIPH_CFB_MODE:
+            ret_mode = atom_cfb_mode;
+            break;
+
+        case EVP_CIPH_OFB_MODE:
+            ret_mode = atom_ofb_mode;
+            break;
+
+#ifdef EVP_CIPH_CTR_MODE
+        case EVP_CIPH_CTR_MODE:
+            ret_mode = atom_ctr_mode;
+            break;
+#endif
+
+#ifdef EVP_CIPH_GCM_MODE
+        case EVP_CIPH_GCM_MODE:
+            ret_mode = atom_gcm_mode;
+            break;
+#endif
+
+#ifdef EVP_CIPH_CCM_MODE
+        case EVP_CIPH_CCM_MODE:
+            ret_mode = atom_ccm_mode;
+            break;
+#endif
+
+#ifdef EVP_CIPH_XTS_MODE
+        case EVP_CIPH_XTS_MODE:
+            ret_mode = atom_xts_mode;
+            break;
+#endif
+
+#ifdef EVP_CIPH_WRAP_MODE
+        case EVP_CIPH_WRAP_MODE:
+            ret_mode = atom_wrap_mode;
+            break;
+#endif
+
+#ifdef EVP_CIPH_OCB_MODE
+        case EVP_CIPH_OCB_MODE:
+            ret_mode = atom_ocb_mode;
+            break;
+#endif
+
+        case EVP_CIPH_STREAM_CIPHER:
+            ret_mode = atom_stream_cipher;
+            break;
+
+        default:
+            ret_mode = atom_undefined;
+            break;
     }
-    return NULL;
+
+    enif_make_map_put(env, ret, atom_mode, ret_mode, &ret);
+
+    return ret;
+}
+
+const struct cipher_type_t* get_cipher_type_no_key(ERL_NIF_TERM type)
+{
+    struct cipher_type_t key;
+
+    key.type.atom = type;
+
+    return bsearch(&key, cipher_types, num_cipher_types, sizeof(cipher_types[0]), cmp_cipher_types_no_key);
+}
+
+int cmp_cipher_types_no_key(const void *keyp, const void *elemp) {
+    const struct cipher_type_t *key  = keyp;
+    const struct cipher_type_t *elem = elemp;
+
+    if (key->type.atom < elem->type.atom) return -1;
+    else if (key->type.atom > elem->type.atom) return 1;
+    else /* key->type.atom == elem->type.atom */ return 0;
+}
+
+
+ERL_NIF_TERM cipher_types_as_list(ErlNifEnv* env)
+{
+    struct cipher_type_t* p;
+    ERL_NIF_TERM prev, hd;
+
+    hd = enif_make_list(env, 0);
+    prev = atom_undefined;
+
+    for (p = cipher_types; (p->type.atom & (p->type.atom != atom_false)); p++) {
+        if ((prev == p->type.atom) ||
+            CIPHER_FORBIDDEN_IN_FIPS(p) )
+            continue;
+
+        if ((p->cipher.p != NULL) ||
+            (p->flags & AES_CTR_COMPAT))
+            {
+                hd = enif_make_list_cell(env, p->type.atom, hd);
+            }
+    }
+
+    /* Add aliases: */
+#ifdef HAVE_GCM
+    hd = enif_make_list_cell(env, atom_aes_gcm, hd);
+#endif
+    hd = enif_make_list_cell(env, atom_aes_ecb, hd);
+    hd = enif_make_list_cell(env, atom_aes_ctr, hd);
+    hd = enif_make_list_cell(env, atom_aes_cfb8, hd);
+    hd = enif_make_list_cell(env, atom_aes_cfb128, hd);
+#ifdef HAVE_CCM
+    hd = enif_make_list_cell(env, atom_aes_ccm, hd);
+#endif
+    hd = enif_make_list_cell(env, atom_aes_cbc, hd);
+
+    return hd;
 }

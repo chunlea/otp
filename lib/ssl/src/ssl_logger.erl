@@ -1,7 +1,7 @@
 %%
 %% %CopyrightBegin%
 %%
-%% Copyright Ericsson AB 1999-2018. All Rights Reserved.
+%% Copyright Ericsson AB 1999-2020. All Rights Reserved.
 %%
 %% Licensed under the Apache License, Version 2.0 (the "License");
 %% you may not use this file except in compliance with the License.
@@ -20,9 +20,10 @@
 
 -module(ssl_logger).
 
--export([debug/4,
+-export([log/4, 
+         debug/4,
          format/2,
-         notice/2]).
+         format/1]).
 
 -define(DEC2HEX(X),
         if ((X) >= 0) andalso ((X) =< 9) -> (X) + $0;
@@ -31,36 +32,34 @@
 
 -define(rec_info(T,R),lists:zip(record_info(fields,T),tl(tuple_to_list(R)))).
 
+-include("ssl_internal.hrl").
 -include("tls_record.hrl").
 -include("ssl_cipher.hrl").
 -include("ssl_internal.hrl").
 -include("tls_handshake.hrl").
+-include("dtls_handshake.hrl").
 -include("tls_handshake_1_3.hrl").
 -include_lib("kernel/include/logger.hrl").
 
 %%-------------------------------------------------------------------------
-%% External API
+%% Internal API -- Stateful logging
 %%-------------------------------------------------------------------------
 
-%% SSL log formatter
-format(#{level:= _Level, msg:= {report, Msg}, meta:= _Meta}, _Config0) ->
-     #{direction := Direction,
-       protocol := Protocol,
-       message := BinMsg0} = Msg,
-    case Protocol of
-        'tls_record' ->
-            BinMsg = lists:flatten(BinMsg0),
-            format_tls_record(Direction, BinMsg);
-        'handshake' ->
-            format_handshake(Direction, BinMsg0);
-        _Other ->
-            []
+log(Level, LogLevel, ReportMap, Meta) ->
+    case logger:compare_levels(LogLevel, Level) of
+        lt ->
+            logger:log(Level, ReportMap,  Meta#{depth => ?DEPTH, 
+                                                report_cb => fun ?MODULE:format/1});
+        eq ->
+            logger:log(Level, ReportMap, Meta#{depth => ?DEPTH, 
+                                               report_cb => fun ?MODULE:format/1});
+        _ ->
+            ok
     end.
 
-%% Stateful logging
 debug(Level, Direction, Protocol, Message)
   when (Direction =:= inbound orelse Direction =:= outbound) andalso
-       (Protocol =:= 'tls_record' orelse Protocol =:= 'handshake') ->
+       (Protocol =:= 'record' orelse Protocol =:= 'handshake') ->
     case logger:compare_levels(Level, debug) of
         lt ->
             ?LOG_DEBUG(#{direction => Direction,
@@ -76,17 +75,63 @@ debug(Level, Direction, Protocol, Message)
             ok
     end.
 
-%% Stateful logging
-notice(Level, Report) ->
-    case logger:compare_levels(Level, notice) of
-        lt ->
-            ?LOG_NOTICE(Report);
-        eq ->
-            ?LOG_NOTICE(Report);
-        _ ->
-            ok
+%%-------------------------------------------------------------------------
+%%  Report formatting CB
+%%-------------------------------------------------------------------------
+format(#{alert := Alert, alerter := own} = Report) ->
+    #{protocol := ProtocolName,
+      role := Role,
+      alert := Alert,
+      statename := StateName } = Report,
+    ssl_alert:own_alert_format(ProtocolName, Role, StateName, Alert);
+format(#{alert := Alert, alerter := peer} = Report) ->
+    #{protocol := ProtocolName,
+      role := Role,
+      alert := Alert,
+      statename := StateName } = Report,
+    ssl_alert:alert_format(ProtocolName, Role, StateName, Alert);
+format(#{alert := Alert, alerter := ignored} = Report) -> 
+    #{protocol := ProtocolName,
+      role := Role,
+      alert := Alert,
+      statename := StateName} = Report,
+    %% Happens in DTLS
+    {Fmt, Args} = ssl_alert:own_alert_format(ProtocolName, Role, StateName, Alert),
+    {"~s " ++ Fmt, ["Ignored alert to mitigate DoS attacks", Args]};
+format(#{description := Desc, reason := Reason}) ->
+    {"~12s ~p"
+     "~n"
+     "~12s ~p"
+     "~n",
+     ["Description:", Desc, "Reason:", Reason]
+    }.
+
+%%-------------------------------------------------------------------------
+%%  SSL log handler formatter
+%%-------------------------------------------------------------------------
+format(#{msg:= {report, Msg}}, _Config0) ->
+     #{direction := Direction,
+       protocol := Protocol,
+       message := Content} = Msg,
+    case Protocol of
+        'record' ->
+            BinMsg =
+                case Content of
+                    #ssl_tls{} ->
+                        [tls_record:build_tls_record(Content)];
+                    _ when is_list(Content) ->
+                        lists:flatten(Content)
+                end,
+            format_tls_record(Direction, BinMsg);
+        'handshake' ->
+            format_handshake(Direction, Content);
+        _Other ->
+            []
     end.
 
+%%-------------------------------------------------------------------------
+%%  Internal functions
+%%-------------------------------------------------------------------------
 
 %%-------------------------------------------------------------------------
 %% Handshake Protocol
@@ -124,10 +169,20 @@ parse_handshake(Direction, #server_hello{
                             [?rec_info(server_hello,
                                        ServerHello#server_hello{cipher_suite = CipherSuite})]),
     {Header, Message};
+parse_handshake(Direction, #hello_verify_request{} = HelloVerifyRequest) ->
+    Header = io_lib:format("~s Handshake, HelloVerifyRequest",
+                           [header_prefix(Direction)]),
+    Message = io_lib:format("~p", [?rec_info(hello_verify_request, HelloVerifyRequest)]),
+    {Header, Message};
 parse_handshake(Direction, #certificate{} = Certificate) ->
     Header = io_lib:format("~s Handshake, Certificate",
                            [header_prefix(Direction)]),
     Message = io_lib:format("~p", [?rec_info(certificate, Certificate)]),
+    {Header, Message};
+parse_handshake(Direction, #certificate_status{} = CertificateStatus) ->
+    Header = io_lib:format("~s Handshake, CertificateStatus",
+                           [header_prefix(Direction)]),
+    Message = io_lib:format("~p", [?rec_info(certificate_status, CertificateStatus)]),
     {Header, Message};
 parse_handshake(Direction, #server_key_exchange{} = ServerKeyExchange) ->
     Header = io_lib:format("~s Handshake, ServerKeyExchange",
@@ -169,6 +224,11 @@ parse_handshake(Direction, #hello_request{} = HelloRequest) ->
                            [header_prefix(Direction)]),
     Message = io_lib:format("~p", [?rec_info(hello_request, HelloRequest)]),
     {Header, Message};
+parse_handshake(Direction, #certificate_request_1_3{} = CertificateRequest) ->
+    Header = io_lib:format("~s Handshake, CertificateRequest",
+                           [header_prefix(Direction)]),
+    Message = io_lib:format("~p", [?rec_info(certificate_request_1_3, CertificateRequest)]),
+    {Header, Message};
 parse_handshake(Direction, #certificate_1_3{} = Certificate) ->
     Header = io_lib:format("~s Handshake, Certificate",
                            [header_prefix(Direction)]),
@@ -183,16 +243,34 @@ parse_handshake(Direction, #encrypted_extensions{} = EncryptedExtensions) ->
     Header = io_lib:format("~s Handshake, EncryptedExtensions",
                            [header_prefix(Direction)]),
     Message = io_lib:format("~p", [?rec_info(encrypted_extensions, EncryptedExtensions)]),
+    {Header, Message};
+parse_handshake(Direction, #new_session_ticket{} = NewSessionTicket) ->
+    Header = io_lib:format("~s Post-Handshake, NewSessionTicket",
+                           [header_prefix(Direction)]),
+    Message = io_lib:format("~p", [?rec_info(new_session_ticket, NewSessionTicket)]),
+    {Header, Message};
+parse_handshake(Direction, #key_update{} = KeyUpdate) ->
+    Header = io_lib:format("~s Post-Handshake, KeyUpdate",
+                           [header_prefix(Direction)]),
+    Message = io_lib:format("~p", [?rec_info(key_update, KeyUpdate)]),
+    {Header, Message};
+parse_handshake(Direction, #end_of_early_data{} = EndOfEarlyData) ->
+    Header = io_lib:format("~s Handshake, EndOfEarlyData",
+                           [header_prefix(Direction)]),
+    Message = io_lib:format("~p", [?rec_info(end_of_early_data, EndOfEarlyData)]),
     {Header, Message}.
-
 
 parse_cipher_suites([_|_] = Ciphers) ->
     [format_cipher(C) || C <- Ciphers].
 
-format_cipher(?TLS_EMPTY_RENEGOTIATION_INFO_SCSV) ->
-    'TLS_EMPTY_RENEGOTIATION_INFO_SCSV';
 format_cipher(C0) ->
-    list_to_atom(ssl_cipher_format:openssl_suite_name(C0)).
+    try ssl_cipher_format:suite_bin_to_map(C0) of
+        Map ->
+            ssl_cipher_format:suite_map_to_str(Map)
+    catch 
+        error:function_clause ->
+            format_uknown_cipher_suite(C0)
+    end.
 
 get_client_version(Version, Extensions) ->
     CHVersions = maps:get(client_hello_versions, Extensions, undefined),
@@ -222,9 +300,12 @@ version({3,1}) ->
     "TLS 1.0";
 version({3,0}) ->
     "SSL 3.0";
+version({254,253}) ->
+    "DTLS 1.2";
+version({254,255}) ->
+    "DTLS 1.0";
 version({M,N}) ->
-    io_lib:format("TLS [0x0~B0~B]", [M,N]).
-
+    io_lib:format("TLS/DTLS [0x0~B0~B]", [M,N]).
 
 header_prefix(inbound) ->
     "<<<";
@@ -258,8 +339,12 @@ tls_record_version([<<?BYTE(B),?BYTE(3),?BYTE(1),_/binary>>|_]) ->
     io_lib:format("TLS 1.0 Record Protocol, ~s", [msg_type(B)]);
 tls_record_version([<<?BYTE(B),?BYTE(3),?BYTE(0),_/binary>>|_]) ->
     io_lib:format("SSL 3.0 Record Protocol, ~s", [msg_type(B)]);
+tls_record_version([<<?BYTE(B),?BYTE(254),?BYTE(253),_/binary>>|_]) ->
+    io_lib:format("DTLS 1.2 Record Protocol, ~s", [msg_type(B)]);
+tls_record_version([<<?BYTE(B),?BYTE(254),?BYTE(255),_/binary>>|_]) ->
+    io_lib:format("DTLS 1.0 Record Protocol, ~s", [msg_type(B)]);
 tls_record_version([<<?BYTE(B),?BYTE(M),?BYTE(N),_/binary>>|_]) ->
-    io_lib:format("TLS [0x0~B0~B] Record Protocol, ~s", [M, N, msg_type(B)]).
+    io_lib:format("TLS/DTLS [0x0~B0~B] Record Protocol, ~s", [M, N, msg_type(B)]).
 
 
 msg_type(20) -> "change_cipher_spec";
@@ -340,12 +425,12 @@ convert_to_hex(P, [H|T], Row, Acc, C) when is_integer(H) ->
                    C + 1).
 
 
-row_prefix(tls_record, N) ->
+row_prefix(_ , N) ->
     S = string:pad(string:to_lower(erlang:integer_to_list(N, 16)),4,leading,$0),
     lists:reverse(lists:flatten(S ++ " - ")).
 
 
-end_row(tls_record, Row) ->
+end_row(_, Row) ->
     Row ++ "  ".
 
 
@@ -412,3 +497,7 @@ number_to_hex(N) ->
         H ->
             lists:reverse(H)
     end.
+ 
+format_uknown_cipher_suite(<<?BYTE(X), ?BYTE(Y)>>) ->
+    "0x" ++ number_to_hex(X) ++ "0x" ++ number_to_hex(Y).
+

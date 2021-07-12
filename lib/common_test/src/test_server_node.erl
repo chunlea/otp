@@ -1,7 +1,7 @@
 %%
 %% %CopyrightBegin%
 %%
-%% Copyright Ericsson AB 2002-2018. All Rights Reserved.
+%% Copyright Ericsson AB 2002-2020. All Rights Reserved.
 %%
 %% Licensed under the Apache License, Version 2.0 (the "License");
 %% you may not use this file except in compliance with the License.
@@ -18,7 +18,7 @@
 %% %CopyrightEnd%
 %%
 -module(test_server_node).
--compile(r16).
+-compile(r20).
 
 %%%
 %%% The same compiled code for this module must be possible to load
@@ -26,7 +26,7 @@
 %%%
 
 %% Test Controller interface
--export([is_release_available/1]).
+-export([is_release_available/1, find_release/1]).
 -export([start_tracer_node/2,trace_nodes/2,stop_tracer_node/1]).
 -export([start_node/5, stop_node/1]).
 -export([kill_nodes/0, nodedown/1]).
@@ -598,10 +598,19 @@ pick_erl_program(L) ->
 	{prog, S} ->
 	    S;
 	{release, S} ->
+            clear_erl_aflags(),
 	    find_release(S);
 	this ->
 	    ct:get_progname()
     end.
+
+clear_erl_aflags() ->
+    %% When starting a node with a previous release, options in
+    %% ERL_AFLAGS could prevent the node from starting. For example,
+    %% if ERL_AFLAGS is set to "-emu_type lcnt", the node will only
+    %% start if the previous release happens to also have a lock
+    %% counter emulator installed (unlikely).
+    os:unsetenv("ERL_AFLAGS").
 
 %% This is an attempt to distinguish between spaces in the program
 %% path and spaces that separate arguments. The program is quoted to
@@ -636,7 +645,38 @@ find_release(latest) ->
 find_release(previous) ->
     "kaka";
 find_release(Rel) ->
-    find_release(os:type(), Rel).
+    case find_release(os:type(), Rel) of
+        none ->
+            find_release_path(Rel);
+        Else ->
+            Else
+    end.
+
+find_release_path(Rel) ->
+    Paths = string:lexemes(os:getenv("PATH"), ":"),
+    find_release_path(Paths, Rel).
+find_release_path([Path|T], Rel) ->
+    case os:find_executable("erl", Path) of
+        false ->
+            find_release_path(T, Rel);
+        ErlExec ->
+            Pattern = filename:join([Path,"..","releases","*","OTP_VERSION"]),
+            case filelib:wildcard(Pattern) of
+                [VersionFile] ->
+                    {ok, VsnBin} = file:read_file(VersionFile),
+                    [MajorVsn|_] = string:lexemes(VsnBin, "."),
+                    case unicode:characters_to_list(MajorVsn) of
+                        Rel ->
+                            ErlExec;
+                        _Else ->
+                            find_release_path(T, Rel)
+                    end;
+                _Else ->
+                    find_release_path(T, Rel)
+            end
+    end;
+find_release_path([], _) ->
+    none.
 
 find_release({unix,sunos}, Rel) ->
     case os:cmd("uname -p") of
@@ -656,9 +696,19 @@ find_release({unix,linux}, Rel) ->
 find_release(_, _) -> none.
 
 find_rel_linux(Rel) ->
-    case suse_release() of
-	none -> [];
-	SuseRel -> find_rel_suse(Rel, SuseRel)
+    try
+        case ubuntu_release() of
+            none -> none;
+            [UbuntuRel |_] -> throw(find_rel_ubuntu(Rel, UbuntuRel))
+        end,
+        case suse_release() of
+            none -> none;
+            SuseRel -> throw(find_rel_suse(Rel, SuseRel))
+        end,
+        []
+    catch
+        throw:Result ->
+            Result
     end.
 
 find_rel_suse(Rel, SuseRel) ->
@@ -734,6 +784,93 @@ suse_release(Fd) ->
 		    Version
 	    end
     end.
+
+find_rel_ubuntu(_Rel, UbuntuRel) when is_integer(UbuntuRel), UbuntuRel < 16 ->
+    [];
+find_rel_ubuntu(Rel, UbuntuRel) when is_integer(UbuntuRel) ->
+    Root = "/usr/local/otp/releases/ubuntu",
+    lists:foldl(fun (ChkUbuntuRel, Acc) ->
+                        find_rel_ubuntu_aux1(Rel, Root++integer_to_list(ChkUbuntuRel))
+                            ++ Acc
+                end,
+                [],
+                lists:seq(16, UbuntuRel)).
+
+find_rel_ubuntu_aux1(Rel, RootWc) ->
+    case erlang:system_info(wordsize) of
+	4 ->
+	    find_rel_ubuntu_aux2(Rel, RootWc++"_32");
+	8 ->
+	    find_rel_ubuntu_aux2(Rel, RootWc++"_64") ++
+		find_rel_ubuntu_aux2(Rel, RootWc++"_32")
+    end.
+
+find_rel_ubuntu_aux2(Rel, RootWc) ->
+    RelDir = filename:dirname(RootWc),
+    Pat = filename:basename(RootWc ++ "_" ++ Rel) ++ ".*",
+    case file:list_dir(RelDir) of
+	{ok,Dirs} ->
+	    case lists:filter(fun(Dir) ->
+				      case re:run(Dir, Pat, [unicode]) of
+					  nomatch -> false;
+					  _       -> true
+				      end
+			      end, Dirs) of
+		[] ->
+		    [];
+		[R|_] ->
+		    [filename:join([RelDir,R,"bin","erl"])]
+	    end;
+	_ ->
+	    []
+    end.
+
+ubuntu_release() ->
+    case file:open("/etc/lsb-release", [read]) of
+	{ok,Fd} ->
+	    try
+		ubuntu_release(Fd, undefined, undefined)
+	    after
+		file:close(Fd)
+	    end;
+	{error,_} -> none
+    end.
+
+ubuntu_release(_Fd, DistrId, Rel) when DistrId /= undefined,
+                                      Rel /= undefined ->
+    Ubuntu = case DistrId of
+                 "Ubuntu" -> true;
+                 "ubuntu" -> true;
+                 _ -> false
+             end,
+    case Ubuntu of
+        false -> none;
+        true -> Rel
+    end;
+ubuntu_release(Fd, DistroId, Rel) ->
+    case io:get_line(Fd, '') of
+	eof ->
+            none;
+	Line when is_list(Line) ->
+	    case re:run(Line, "^DISTRIB_ID=(\\w+)$",
+                        [{capture,all_but_first,list}]) of
+		{match,[NewDistroId]} ->
+                    ubuntu_release(Fd, NewDistroId, Rel);
+                nomatch ->
+                    case re:run(Line, "^DISTRIB_RELEASE=(\\d+(?:\\.\\d+)*)$",
+                                [{capture,all_but_first,list}]) of
+                        {match,[RelList]} ->
+                            NewRel = lists:map(fun (N) ->
+                                                       list_to_integer(N)
+                                               end,
+                                               string:lexemes(RelList, ".")),
+                            ubuntu_release(Fd, DistroId, NewRel);
+                        nomatch ->
+                            ubuntu_release(Fd, DistroId, Rel)
+                    end
+            end
+    end.
+
 
 unpack(Bin) ->
     {One,Term} = split_binary(Bin, 1),

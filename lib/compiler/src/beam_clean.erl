@@ -31,10 +31,11 @@ module({Mod,Exp,Attr,Fs0,_}, Opts) ->
     Order = [Lbl || {function,_,_,Lbl,_} <- Fs0],
     All = maps:from_list([{Lbl,Func} || {function,_,_,Lbl,_}=Func <- Fs0]),
     WorkList = rootset(Fs0, Exp, Attr),
-    Used = find_all_used(WorkList, All, cerl_sets:from_list(WorkList)),
+    Used = find_all_used(WorkList, All, sets:from_list(WorkList, [{version, 2}])),
     Fs1 = remove_unused(Order, Used, All),
     {Fs2,Lc} = clean_labels(Fs1),
-    Fs = maybe_remove_lines(Fs2, Opts),
+    Fs3 = fix_swap(Fs2, Opts),
+    Fs = maybe_remove_lines(Fs3, Opts),
     {ok,{Mod,Exp,Attr,Fs,Lc}}.
 
 %% Determine the rootset, i.e. exported functions and
@@ -53,7 +54,7 @@ rootset(Fs, Root0, Attr) ->
 %% Remove the unused functions.
 
 remove_unused([F|Fs], Used, All) ->
-    case cerl_sets:is_element(F, Used) of
+    case sets:is_element(F, Used) of
 	false -> remove_unused(Fs, Used, All);
 	true -> [map_get(F, All)|remove_unused(Fs, Used, All)]
     end;
@@ -71,14 +72,16 @@ update_work_list([{call,_,{f,L}}|Is], Sets) ->
     update_work_list(Is, add_to_work_list(L, Sets));
 update_work_list([{make_fun2,{f,L},_,_,_}|Is], Sets) ->
     update_work_list(Is, add_to_work_list(L, Sets));
+update_work_list([{make_fun3,{f,L},_,_,_,_}|Is], Sets) ->
+    update_work_list(Is, add_to_work_list(L, Sets));
 update_work_list([_|Is], Sets) ->
     update_work_list(Is, Sets);
 update_work_list([], Sets) -> Sets.
 
 add_to_work_list(F, {Fs,Used}=Sets) ->
-    case cerl_sets:is_element(F, Used) of
+    case sets:is_element(F, Used) of
 	true -> Sets;
-	false -> {[F|Fs],cerl_sets:add_element(F, Used)}
+	false -> {[F|Fs],sets:add_element(F, Used)}
     end.
 
 
@@ -137,31 +140,54 @@ function_replace([{function,Name,Arity,Entry,Asm0}|Fs], Dict, Acc) ->
 function_replace([], _, Acc) -> Acc.
 
 %%%
+%%% If compatibility with a previous release (OTP 22 or earlier) has
+%%% been requested, replace swap instructions with a sequence of moves.
+%%%
+
+fix_swap(Fs, Opts) ->
+    case proplists:get_bool(no_swap, Opts) of
+        false -> Fs;
+        true -> fold_functions(fun swap_moves/1, Fs)
+    end.
+
+swap_moves([{swap,Reg1,Reg2}|Is]) ->
+    Temp = {x,1022},
+    [{move,Reg1,Temp},{move,Reg2,Reg1},{move,Temp,Reg2}|swap_moves(Is)];
+swap_moves([I|Is]) ->
+    [I|swap_moves(Is)];
+swap_moves([]) -> [].
+
+%%%
 %%% Remove line instructions if requested.
 %%%
 
 maybe_remove_lines(Fs, Opts) ->
     case proplists:get_bool(no_line_info, Opts) of
 	false -> Fs;
-	true -> remove_lines(Fs)
+	true -> fold_functions(fun remove_lines/1, Fs)
     end.
 
-remove_lines([{function,N,A,Lbl,Is0}|T]) ->
-    Is = remove_lines_fun(Is0),
-    [{function,N,A,Lbl,Is}|remove_lines(T)];
-remove_lines([]) -> [].
-
-remove_lines_fun([{line,_}|Is]) ->
-    remove_lines_fun(Is);
-remove_lines_fun([{block,Bl0}|Is]) ->
+remove_lines([{line,_}|Is]) ->
+    remove_lines(Is);
+remove_lines([{block,Bl0}|Is]) ->
     Bl = remove_lines_block(Bl0),
-    [{block,Bl}|remove_lines_fun(Is)];
-remove_lines_fun([I|Is]) ->
-    [I|remove_lines_fun(Is)];
-remove_lines_fun([]) -> [].
+    [{block,Bl}|remove_lines(Is)];
+remove_lines([I|Is]) ->
+    [I|remove_lines(Is)];
+remove_lines([]) -> [].
 
 remove_lines_block([{set,_,_,{line,_}}|Is]) ->
     remove_lines_block(Is);
 remove_lines_block([I|Is]) ->
     [I|remove_lines_block(Is)];
 remove_lines_block([]) -> [].
+
+
+%%%
+%%% Helpers.
+%%%
+
+fold_functions(F, [{function,N,A,Lbl,Is0}|T]) ->
+    Is = F(Is0),
+    [{function,N,A,Lbl,Is}|fold_functions(F, T)];
+fold_functions(_F, []) -> [].

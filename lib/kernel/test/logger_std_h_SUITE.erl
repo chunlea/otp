@@ -1,7 +1,7 @@
 %%
 %% %CopyrightBegin%
 %%
-%% Copyright Ericsson AB 2018. All Rights Reserved.
+%% Copyright Ericsson AB 2018-2020. All Rights Reserved.
 %%
 %% Licensed under the Apache License, Version 2.0 (the "License");
 %% you may not use this file except in compliance with the License.
@@ -71,6 +71,14 @@ init_per_group(_Group, Config) ->
 end_per_group(_Group, _Config) ->
     ok.
 
+init_per_testcase(reopen_changed_log=TC, Config) ->
+    case os:type() of
+        {win32,_} ->
+            {skip,"This test can only work with inodes, i.e. not on Windows"};
+        _ ->
+            ct:print("********** ~w **********", [TC]),
+            Config
+    end;
 init_per_testcase(TestHooksCase, Config) when
       TestHooksCase == write_failure;
       TestHooksCase == sync_failure ->
@@ -110,8 +118,11 @@ all() ->
     [add_remove_instance_tty,
      add_remove_instance_standard_io,
      add_remove_instance_standard_error,
+     add_remove_instance_custom_device,
      add_remove_instance_file1,
      add_remove_instance_file2,
+     add_remove_instance_file3,
+     add_remove_instance_file4,
      default_formatter,
      filter_config,
      errors,
@@ -122,6 +133,7 @@ all() ->
      bad_input,
      reconfig,
      file_opts,
+     relative_file_path,
      sync,
      write_failure,
      sync_failure,
@@ -141,7 +153,14 @@ all() ->
      mem_kill_std,
      restart_after,
      handler_requests_under_load,
-     recreate_deleted_log
+     recreate_deleted_log,
+     reopen_changed_log,
+     rotate_size,
+     rotate_size_compressed,
+     rotate_size_reopen,
+     rotate_on_start_compressed,
+     rotation_opts,
+     rotation_opts_restart_handler
     ].
 
 add_remove_instance_tty(_Config) ->
@@ -155,6 +174,11 @@ add_remove_instance_tty(_Config) ->
 add_remove_instance_standard_io(_Config) ->
     add_remove_instance_nofile(standard_io).
 add_remove_instance_standard_io(cleanup,_Config) ->
+    logger_std_h_remove().
+
+add_remove_instance_custom_device(_Config) ->
+    add_remove_instance_nofile({device,user}).
+add_remove_instance_custom_device(cleanup,_Config) ->
     logger_std_h_remove().
 
 add_remove_instance_standard_error(_Config) ->
@@ -178,10 +202,27 @@ add_remove_instance_file2(Config) ->
 add_remove_instance_file2(cleanup,_Config) ->
     logger_std_h_remove().
 
-add_remove_instance_file(Log, Type) ->
+add_remove_instance_file3(_Config) ->
+    Log = atom_to_list(?MODULE),
+    StdHConfig = #{type=>file},
+    add_remove_instance_file(Log, StdHConfig).
+add_remove_instance_file3(cleanup,_Config) ->
+    logger_std_h_remove().
+
+add_remove_instance_file4(Config) ->
+    Dir = ?config(priv_dir,Config),
+    Log = filename:join(Dir,"stdlog4.txt"),
+    StdHConfig = #{file=>Log,modes=>[]},
+    add_remove_instance_file(Log, StdHConfig).
+add_remove_instance_file4(cleanup,_Config) ->
+    logger_std_h_remove().
+
+add_remove_instance_file(Log, Type) when not is_map(Type) ->
+    add_remove_instance_file(Log,#{type=>Type});
+add_remove_instance_file(Log, StdHConfig) when is_map(StdHConfig) ->
     ok = logger:add_handler(?MODULE,
                             logger_std_h,
-                            #{config => #{type => Type},
+                            #{config => StdHConfig,
                               filter_default=>stop,
                               filters=>?DEFAULT_HANDLER_FILTERS([?MODULE]),
                               formatter=>{?MODULE,self()}}),
@@ -250,15 +291,23 @@ errors(Config) ->
         _ ->
             NoDir = lists:concat(["/",?MODULE,"_dir"]),
             {error,
-             {handler_not_added,{open_failed,NoDir,eacces}}} =
+             {handler_not_added,{open_failed,NoDir,Error}}} =
                 logger:add_handler(myh2,logger_std_h,
-                                   #{config=>#{type=>{file,NoDir}}})
+                                   #{config=>#{type=>{file,NoDir}}}),
+            case Error of
+                erofs ->
+                    %% Happens on OS X
+                    ok;
+                eacces ->
+                    ok
+            end
     end,
 
     {error,
-     {handler_not_added,{open_failed,Log,_}}} =
+     {handler_not_added,
+      {invalid_config,logger_std_h,#{modes:=bad_file_opt}}}} =
         logger:add_handler(myh3,logger_std_h,
-                           #{config=>#{type=>{file,Log,[bad_file_opt]}}}),
+                           #{config=>#{type=>{file,Log,bad_file_opt}}}),
 
     ok = logger:notice(?msg).
 
@@ -268,6 +317,8 @@ errors(cleanup,_Config) ->
 formatter_fail(Config) ->
     Dir = ?config(priv_dir,Config),
     Log = filename:join(Dir,?FUNCTION_NAME),
+
+    logger:set_primary_config(level,notice),
 
     %% no formatter
     ok = logger:add_handler(?MODULE,
@@ -310,6 +361,7 @@ formatter_fail(Config) ->
     ok.
 
 formatter_fail(cleanup,_Config) ->
+    logger:set_primary_config(level,info),
     logger:remove_handler(?MODULE).
 
 config_fail(_Config) ->
@@ -606,30 +658,105 @@ reconfig(cleanup, _Config) ->
 file_opts(Config) ->
     Dir = ?config(priv_dir,Config),
     Log = filename:join(Dir, lists:concat([?FUNCTION_NAME,".log"])),
-    BadFileOpts = [raw],
-    BadType = {file,Log,BadFileOpts},
-    {error,{handler_not_added,{open_failed,Log,enoent}}} =
-        logger:add_handler(?MODULE, logger_std_h,
-                           #{config => #{type => BadType}}),
+    MissingOpts = [raw],
+    Type1 = {file,Log,MissingOpts},
+    ok = logger:add_handler(?MODULE, logger_std_h,
+                            #{config => #{type => Type1}}),
+    {ok,#{config:=#{type:=file,file:=Log,modes:=Modes1}}} =
+        logger:get_handler_config(?MODULE),
+    [append,delayed_write,raw] = lists:sort(Modes1),
+    ok = logger:remove_handler(?MODULE),
 
     OkFileOpts = [raw,append],
     OkType = {file,Log,OkFileOpts},
     ok = logger:add_handler(?MODULE,
                             logger_std_h,
-                            #{config => #{type => OkType},
+                            #{config => #{type => OkType}, % old format
                               filter_default=>log,
                               filters=>?DEFAULT_HANDLER_FILTERS([?MODULE]),
                               formatter=>{?MODULE,self()}}),
 
-    #{cb_state := #{handler_state := #{type := OkType}}} =
+    ModOpts = [delayed_write|OkFileOpts],
+    #{cb_state := #{handler_state := #{type:=file,
+                                       file:=Log,
+                                       modes:=ModOpts}}} =
         logger_olp:info(h_proc_name()),
-    {ok,#{config := #{type := OkType}}} = logger:get_handler_config(?MODULE),
+    {ok,#{config := #{type:=file,
+                      file:=Log,
+                      modes:=ModOpts}}} = logger:get_handler_config(?MODULE),
+    ok = logger:remove_handler(?MODULE),
+
+    ok = logger:add_handler(?MODULE,
+                            logger_std_h,
+                            #{config => #{type => file,
+                                          file => Log,
+                                          modes => OkFileOpts}, % new format
+                              filter_default=>log,
+                              filters=>?DEFAULT_HANDLER_FILTERS([?MODULE]),
+                              formatter=>{?MODULE,self()}}),
+
+    #{cb_state := #{handler_state := #{type:=file,
+                                       file:=Log,
+                                       modes:=ModOpts}}} =
+        logger_olp:info(h_proc_name()),
+    {ok,#{config := #{type:=file,
+                      file:=Log,
+                      modes:=ModOpts}}} =
+        logger:get_handler_config(?MODULE),
     logger:notice(M1=?msg,?domain),
     ?check(M1),
     B1 = ?bin(M1),
     try_read_file(Log, {ok,B1}, filesync_rep_int()),
     ok.
 file_opts(cleanup, _Config) ->
+    logger:remove_handler(?MODULE).
+
+relative_file_path(_Config) ->
+    {ok,Dir} = file:get_cwd(),
+    AbsName1 = filename:join(Dir,?MODULE),
+    ok = logger:add_handler(?MODULE,
+                            logger_std_h,
+                            #{config => #{type=>file},
+                              filter_default=>log,
+                              filters=>?DEFAULT_HANDLER_FILTERS([?MODULE]),
+                              formatter=>{?MODULE,self()}}),
+    #{cb_state := #{handler_state := #{file:=AbsName1}}} =
+        logger_olp:info(h_proc_name()),
+    {ok,#{config := #{file:=AbsName1}}} =
+        logger:get_handler_config(?MODULE),
+    ok = logger:remove_handler(?MODULE),
+
+    RelName2 = filename:join(atom_to_list(?FUNCTION_NAME),
+                             lists:concat([?FUNCTION_NAME,".log"])),
+    AbsName2 = filename:join(Dir,RelName2),
+    ok = logger:add_handler(?MODULE,
+                            logger_std_h,
+                            #{config => #{file => RelName2},
+                              filter_default=>log,
+                              filters=>?DEFAULT_HANDLER_FILTERS([?MODULE]),
+                              formatter=>{?MODULE,self()}}),
+    #{cb_state := #{handler_state := #{file:=AbsName2}}} =
+        logger_olp:info(h_proc_name()),
+    {ok,#{config := #{file:=AbsName2}}} =
+        logger:get_handler_config(?MODULE),
+    logger:notice(M1=?msg,?domain),
+    ?check(M1),
+    B1 = ?bin(M1),
+    try_read_file(AbsName2, {ok,B1}, filesync_rep_int()),
+
+    ok = file:set_cwd(".."),
+    logger:notice(M2=?msg,?domain),
+    ?check(M2),
+    B20 = ?bin(M2),
+    B2 = <<B1/binary,B20/binary>>,
+    try_read_file(AbsName2, {ok,B2}, filesync_rep_int()),
+
+    {error,_} = logger:update_handler_config(?MODULE,config,#{file=>RelName2}),
+    ok = logger:update_handler_config(?MODULE,config,#{file=>AbsName2}),
+    ok = file:set_cwd(Dir),
+    ok = logger:update_handler_config(?MODULE,config,#{file=>RelName2}),
+    ok.
+relative_file_path(cleanup,_Config) ->
     logger:remove_handler(?MODULE).
 
 
@@ -639,13 +766,14 @@ sync(Config) ->
     Type = {file,Log},
     ok = logger:add_handler(?MODULE,
                             logger_std_h,
-                            #{config => #{type => Type},
+                            #{config => #{type => Type,
+                                          file_check => 10000},
                               filter_default=>log,
                               filters=>?DEFAULT_HANDLER_FILTERS([?MODULE]),
                               formatter=>{?MODULE,nl}}),
 
     %% check repeated filesync happens
-    start_tracer([{logger_std_h, write_to_dev, 5},
+    start_tracer([{logger_std_h, write_to_dev, 2},
                   {file, datasync, 1}],
                  [{logger_std_h, write_to_dev, <<"first\n">>},
                   {file,datasync}]),
@@ -655,7 +783,7 @@ sync(Config) ->
     check_tracer(filesync_rep_int()*2),
 
     %% check that explicit filesync is only done once
-    start_tracer([{logger_std_h, write_to_dev, 5},
+    start_tracer([{logger_std_h, write_to_dev, 2},
                   {file, datasync, 1}],
                  [{logger_std_h, write_to_dev, <<"second\n">>},
                   {file,datasync},
@@ -674,7 +802,7 @@ sync(Config) ->
                                       #{filesync_repeat_interval => no_repeat}),
     no_repeat = maps:get(filesync_repeat_interval,
                          maps:get(cb_state, logger_olp:info(h_proc_name()))),
-    start_tracer([{logger_std_h, write_to_dev, 5},
+    start_tracer([{logger_std_h, write_to_dev, 2},
                   {file, datasync, 1}],
                  [{logger_std_h, write_to_dev, <<"third\n">>},
                   {file,datasync},
@@ -706,7 +834,7 @@ sync(Config) ->
     check_tracer(100),
     ok.
 sync(cleanup, _Config) ->
-    dbg:stop_clear(),
+    stop_clear(),
     logger:remove_handler(?MODULE).
 
 write_failure(Config) ->
@@ -1269,6 +1397,405 @@ recreate_deleted_log(Config) ->
 recreate_deleted_log(cleanup, _Config) ->
     ok = stop_handler(?MODULE).
 
+reopen_changed_log(Config) ->
+    {Log,_HConfig,_StdHConfig} =
+        start_handler(?MODULE, ?FUNCTION_NAME, Config),
+    logger:notice("first",?domain),
+    logger_std_h:filesync(?MODULE),
+    ok = file:rename(Log,Log++".old"),
+    ok = file:write_file(Log,""),
+    logger:notice("second",?domain),
+    logger_std_h:filesync(?MODULE),
+    {ok,<<"first\n">>} = file:read_file(Log++".old"),
+    {ok,<<"second\n">>} = file:read_file(Log),
+    ok.
+reopen_changed_log(cleanup, _Config) ->
+    ok = stop_handler(?MODULE).
+
+rotate_size(Config) ->
+    {Log,_HConfig,_StdHConfig} =
+        start_handler(?MODULE, ?FUNCTION_NAME, Config),
+    ok = logger:update_handler_config(?MODULE,#{config=>#{max_no_bytes=>1000,
+                                                          max_no_files=>2}}),
+
+    Str = lists:duplicate(19,$a),
+    [logger:notice(Str,?domain) || _ <- lists:seq(1,50)],
+    logger_std_h:filesync(?MODULE),
+    {ok,#file_info{size=1000}} = file:read_file_info(Log),
+    {error,enoent} = file:read_file_info(Log++".0"),
+
+    logger:notice(Str,?domain),
+    logger_std_h:filesync(?MODULE),
+    {ok,#file_info{size=0}} = file:read_file_info(Log),
+    {ok,#file_info{size=1020}} = file:read_file_info(Log++".0"),
+    {error,enoent} = file:read_file_info(Log++".1"),
+
+    [logger:notice(Str,?domain) || _ <- lists:seq(1,51)],
+    logger_std_h:filesync(?MODULE),
+    {ok,#file_info{size=0}} = file:read_file_info(Log),
+    {ok,#file_info{size=1020}} = file:read_file_info(Log++".0"),
+    {ok,#file_info{size=1020}} = file:read_file_info(Log++".1"),
+    {error,enoent} = file:read_file_info(Log++".2"),
+
+    [logger:notice(Str,?domain) || _ <- lists:seq(1,50)],
+    logger_std_h:filesync(?MODULE),
+    {ok,#file_info{size=1000}} = file:read_file_info(Log),
+    {ok,#file_info{size=1020}} = file:read_file_info(Log++".0"),
+    {ok,#file_info{size=1020}} = file:read_file_info(Log++".1"),
+    {error,enoent} = file:read_file_info(Log++".2"),
+
+    logger:notice("bbbb",?domain),
+    logger_std_h:filesync(?MODULE),
+    {ok,#file_info{size=0}} = file:read_file_info(Log),
+    {ok,#file_info{size=1005}} = file:read_file_info(Log++".0"),
+    {ok,#file_info{size=1020}} = file:read_file_info(Log++".1"),
+    {error,enoent} = file:read_file_info(Log++".2"),
+
+    ok.
+rotate_size(cleanup,_Config) ->
+    ok = stop_handler(?MODULE).
+
+rotate_size_compressed(Config) ->
+    {Log,_HConfig,_StdHConfig} =
+        start_handler(?MODULE, ?FUNCTION_NAME, Config),
+    ok = logger:update_handler_config(?MODULE,
+                                      #{config=>#{max_no_bytes=>1000,
+                                                  max_no_files=>2,
+                                                  compress_on_rotate=>true}}),
+    Str = lists:duplicate(19,$a),
+    [logger:notice(Str,?domain) || _ <- lists:seq(1,50)],
+    logger_std_h:filesync(?MODULE),
+    {ok,#file_info{size=1000}} = file:read_file_info(Log),
+    {error,enoent} = file:read_file_info(Log++".0"),
+    {error,enoent} = file:read_file_info(Log++".0.gz"),
+
+    logger:notice(Str,?domain),
+    logger_std_h:filesync(?MODULE),
+    {ok,#file_info{size=0}} = file:read_file_info(Log),
+    {error,enoent} = file:read_file_info(Log++".0"),
+    {ok,#file_info{size=35}} = file:read_file_info(Log++".0.gz"),
+    {error,enoent} = file:read_file_info(Log++".1"),
+    {error,enoent} = file:read_file_info(Log++".1.gz"),
+
+    [logger:notice(Str,?domain) || _ <- lists:seq(1,51)],
+    logger_std_h:filesync(?MODULE),
+    {ok,#file_info{size=0}} = file:read_file_info(Log),
+    {error,enoent} = file:read_file_info(Log++".0"),
+    {ok,#file_info{size=35}} = file:read_file_info(Log++".0.gz"),
+    {error,enoent} = file:read_file_info(Log++".1"),
+    {ok,#file_info{size=35}} = file:read_file_info(Log++".1.gz"),
+    {error,enoent} = file:read_file_info(Log++".2"),
+    {error,enoent} = file:read_file_info(Log++".2.gz"),
+
+    [logger:notice(Str,?domain) || _ <- lists:seq(1,50)],
+    logger_std_h:filesync(?MODULE),
+    {ok,#file_info{size=1000}} = file:read_file_info(Log),
+    {error,enoent} = file:read_file_info(Log++".0"),
+    {ok,#file_info{size=35}} = file:read_file_info(Log++".0.gz"),
+    {error,enoent} = file:read_file_info(Log++".1"),
+    {ok,#file_info{size=35}} = file:read_file_info(Log++".1.gz"),
+    {error,enoent} = file:read_file_info(Log++".2"),
+    {error,enoent} = file:read_file_info(Log++".2.gz"),
+
+    logger:notice("bbbb",?domain),
+    logger_std_h:filesync(?MODULE),
+    {ok,#file_info{size=0}} = file:read_file_info(Log),
+    {error,enoent} = file:read_file_info(Log++".0"),
+    {ok,#file_info{size=38}} = file:read_file_info(Log++".0.gz"),
+    {error,enoent} = file:read_file_info(Log++".1"),
+    {ok,#file_info{size=35}} = file:read_file_info(Log++".1.gz"),
+    {error,enoent} = file:read_file_info(Log++".2"),
+    {error,enoent} = file:read_file_info(Log++".2.gz"),
+
+    ok.
+rotate_size_compressed(cleanup,_Config) ->
+    ok = stop_handler(?MODULE).
+
+rotate_size_reopen(Config) ->
+    {Log,_HConfig,_StdHConfig} =
+        start_handler(?MODULE, ?FUNCTION_NAME, Config),
+    ok = logger:update_handler_config(?MODULE,#{config=>#{max_no_bytes=>1000,
+                                                          max_no_files=>2}}),
+
+    Str = lists:duplicate(19,$a),
+    [logger:notice(Str,?domain) || _ <- lists:seq(1,40)],
+    logger_std_h:filesync(?MODULE),
+    {ok,#file_info{size=800}} = file:read_file_info(Log),
+
+    {ok,HConfig} = logger:get_handler_config(?MODULE),
+    ok = logger:remove_handler(?MODULE),
+    ok = logger:add_handler(?MODULE,maps:get(module,HConfig),HConfig),
+    {ok,#file_info{size=800}} = file:read_file_info(Log),
+
+    [logger:notice(Str,?domain) || _ <- lists:seq(1,40)],
+    logger_std_h:filesync(?MODULE),
+    {ok,#file_info{size=580}} = file:read_file_info(Log),
+    {ok,#file_info{size=1020}} = file:read_file_info(Log++".0"),
+    ok.
+rotate_size_reopen(cleanup,_Config) ->
+    ok = stop_handler(?MODULE).
+
+%% Test that it is possible to start the handler when there
+%% exists a large file that needs rotating at startup.
+rotate_on_start_compressed() ->
+    [{timetrap,{minutes,5}}].
+rotate_on_start_compressed(Config) ->
+
+    application:ensure_all_started(os_mon),
+
+    case file_SUITE:disc_free(?config(priv_dir, Config)) of
+        N when N >= 5 * (1 bsl 30), is_integer(N) ->
+            ct:pal("Free disk: ~w KByte~n", [N]),
+            Log = get_handler_log_name(rotate_on_start_compressed, Config),
+
+            %% Write a 1 GB file to disk
+            {ok, D} = file:open(Log,[write]),
+            [file:write(D,<<0:(1024*1024*8)>>) || _I <- lists:seq(1,1024)],
+            file:close(D),
+
+            NumOfReqs = 500,
+
+            %% Start the handler that will compress and rotate the existing file
+            ok = logger:add_handler(?MODULE,
+                                    logger_std_h,
+                                    #{config => #{sync_mode_qlen => 2,
+                                                  drop_mode_qlen => NumOfReqs+1,
+                                                  flush_qlen => 2*NumOfReqs,
+                                                  burst_limit_enable => false,
+                                                  max_no_bytes=>1048576,
+                                                  max_no_files=>10,
+                                                  compress_on_rotate=>true,
+                                                  type => {file,Log}},
+                                      filter_default=>stop,
+                                      filters=>filter_only_this_domain(?MODULE),
+                                      formatter=>{?MODULE,op}}),
+
+            %% Wait for compression to start
+            timer:sleep(50),
+
+            %% We send a burst here in order to make sure that the
+            %% compression has time to take place. The burst will
+            %% trigger sync mode which means that there will be
+            %% calls made to the file controller process which
+            %% in turn means that when the burst is done the
+            %% compression is done.
+            send_burst({n,NumOfReqs}, seq, {chars,79}, notice),
+            Lines = count_lines(Log),
+            NumOfReqs = Lines,
+            {ok,#file_info{size=1043656}} = file:read_file_info(Log++".0.gz"),
+            ok;
+        _ ->
+            {skip,"Disk not large enough"}
+    end.
+rotate_on_start_compressed(cleanup,Config) ->
+    application:stop(os_mon),
+    application:stop(sasl),
+    file:delete(get_handler_log_name(rotate_on_start_compressed, Config)),
+    file:delete(get_handler_log_name(rotate_on_start_compressed, Config)++".0.gz"),
+    ok = stop_handler(?MODULE).
+
+rotation_opts(Config) ->
+    {Log,_HConfig,StdHConfig} =
+        start_handler(?MODULE, ?FUNCTION_NAME, Config),
+    #{max_no_bytes:=infinity,
+      max_no_files:=0,
+      compress_on_rotate:=false} = StdHConfig,
+
+    %% Test bad rotation config
+    {error,{invalid_config,_,_}} =
+        logger:update_handler_config(?MODULE,config,#{max_no_bytes=>0}),
+    {error,{invalid_config,_,_}} =
+        logger:update_handler_config(?MODULE,config,#{max_no_files=>infinity}),
+    {error,{invalid_config,_,_}} =
+        logger:update_handler_config(?MODULE,config,
+                                     #{compress_on_rotate=>undefined}),
+
+
+    %% Test good rotation config - start with no rotation
+    Str = lists:duplicate(19,$a),
+    [logger:notice(Str,?domain) || _ <- lists:seq(1,10)],
+    logger_std_h:filesync(?MODULE),
+    {ok,#file_info{size=200}} = file:read_file_info(Log),
+    [] = filelib:wildcard(Log++".*"),
+
+    %% Turn on rotation, check that existing file is rotated since its
+    %% size exceeds max_no_bytes
+    ok = logger:update_handler_config(?MODULE,
+                                      config,
+                                      #{max_no_bytes=>100,
+                                        max_no_files=>2}),
+    timer:sleep(100), % give some time to execute config_changed
+    {ok,#file_info{size=0}} = file:read_file_info(Log),
+    Log0 = Log++".0",
+    {ok,#file_info{size=200}} = file:read_file_info(Log0),
+    [Log0] = filelib:wildcard(Log++".*"),
+
+    %% Fill all logs
+    [logger:notice(Str,?domain) || _ <- lists:seq(1,13)],
+    logger_std_h:filesync(?MODULE),
+    {ok,#file_info{size=20}} = file:read_file_info(Log),
+    {ok,#file_info{size=120}} = file:read_file_info(Log0),
+    {ok,#file_info{size=120}} = file:read_file_info(Log++".1"),
+    [_,_] = filelib:wildcard(Log++".*"),
+
+    %% Extend size and count and check that nothing changes with existing files
+    ok = logger:update_handler_config(?MODULE,
+                                      config,
+                                      #{max_no_bytes=>200,
+                                        max_no_files=>3}),
+    timer:sleep(100), % give some time to execute config_changed
+    {ok,#file_info{size=20}} = file:read_file_info(Log),
+    {ok,#file_info{size=120}} = file:read_file_info(Log0),
+    {ok,#file_info{size=120}} = file:read_file_info(Log++".1"),
+    [_,_] = filelib:wildcard(Log++".*"),
+
+    %% Add more log events and see that extended size and count works
+    [logger:notice(Str,?domain) || _ <- lists:seq(1,10)],
+    logger_std_h:filesync(?MODULE),
+    {ok,#file_info{size=0}} = file:read_file_info(Log),
+    {ok,#file_info{size=220}} = file:read_file_info(Log0),
+    {ok,#file_info{size=120}} = file:read_file_info(Log++".1"),
+    {ok,#file_info{size=120}} = file:read_file_info(Log++".2"),
+    [_,_,_] = filelib:wildcard(Log++".*"),
+
+    %% Reduce count and check that archive files that exceed the new
+    %% count are moved
+    ok = logger:update_handler_config(?MODULE,
+                                      config,
+                                      #{max_no_files=>1}),
+    timer:sleep(100), % give some time to execute config_changed
+    {ok,#file_info{size=0}} = file:read_file_info(Log),
+    {ok,#file_info{size=220}} = file:read_file_info(Log0),
+    [Log0] = filelib:wildcard(Log++".*"),
+
+    %% Extend size and count again, and turn on compression. Check
+    %% that archives are compressed
+    ok = logger:update_handler_config(?MODULE,
+                                      config,
+                                      #{max_no_bytes=>100,
+                                        max_no_files=>2,
+                                        compress_on_rotate=>true}),
+    timer:sleep(100), % give some time to execute config_changed
+    {ok,#file_info{size=0}} = file:read_file_info(Log),
+    Log0gz = Log0++".gz",
+    {ok,#file_info{size=29}} = file:read_file_info(Log0gz),
+    [Log0gz] = filelib:wildcard(Log++".*"),
+
+    %% Fill all logs
+    [logger:notice(Str,?domain) || _ <- lists:seq(1,13)],
+    logger_std_h:filesync(?MODULE),
+    {ok,#file_info{size=20}} = file:read_file_info(Log),
+    {ok,#file_info{size=29}} = file:read_file_info(Log0gz),
+    {ok,#file_info{size=29}} = file:read_file_info(Log++".1.gz"),
+    [_,_] = filelib:wildcard(Log++".*"),
+
+    %% Reduce count and turn off compression. Check that archives that
+    %% exceeds the new count are removed, and the rest are
+    %% uncompressed.
+    ok = logger:update_handler_config(?MODULE,
+                                      config,
+                                      #{max_no_files=>1,
+                                        compress_on_rotate=>false}),
+    timer:sleep(100), % give some time to execute config_changed
+    {ok,#file_info{size=20}} = file:read_file_info(Log),
+    {ok,#file_info{size=120}} = file:read_file_info(Log0),
+    [Log0] = filelib:wildcard(Log++".*"),
+
+    %% Check that config and handler state agree on the current rotation settings
+    {ok,#{config:=#{max_no_bytes:=100,
+                    max_no_files:=1,
+                    compress_on_rotate:=false}}} =
+         logger:get_handler_config(?MODULE),
+    #{cb_state:=#{handler_state:=#{max_no_bytes:=100,
+                                   max_no_files:=1,
+                                   compress_on_rotate:=false}}} =
+        logger_olp:info(h_proc_name()),
+    ok.
+rotation_opts(cleanup,_Config) ->
+    ok = stop_handler(?MODULE).
+
+rotation_opts_restart_handler(Config) ->
+    {Log,_HConfig,_StdHConfig} =
+        start_handler(?MODULE, ?FUNCTION_NAME, Config),
+    ok = logger:update_handler_config(?MODULE,
+                                      config,
+                                      #{max_no_bytes=>100,
+                                        max_no_files=>2}),
+
+    %% Fill all logs
+    Str = lists:duplicate(19,$a),
+    [logger:notice(Str,?domain) || _ <- lists:seq(1,15)],
+    logger_std_h:filesync(?MODULE),
+    {ok,#file_info{size=60}} = file:read_file_info(Log),
+    {ok,#file_info{size=120}} = file:read_file_info(Log++".0"),
+    {ok,#file_info{size=120}} = file:read_file_info(Log++".1"),
+    [_,_] = filelib:wildcard(Log++".*"),
+
+    %% Stop/start handler and turn off rotation. Check that archives are removed.
+    {ok,#{config:=StdHConfig1}=HConfig1} = logger:get_handler_config(?MODULE),
+    ok = logger:remove_handler(?MODULE),
+    ok = logger:add_handler(
+           ?MODULE,logger_std_h,
+           HConfig1#{config=>StdHConfig1#{max_no_bytes=>infinity}}),
+    timer:sleep(100),
+    {ok,#file_info{size=60}} = file:read_file_info(Log),
+    [] = filelib:wildcard(Log++".*"),
+
+    %% Add some log events and check that file is no longer rotated.
+    [logger:notice(Str,?domain) || _ <- lists:seq(1,10)],
+    logger_std_h:filesync(?MODULE),
+    {ok,#file_info{size=260}} = file:read_file_info(Log),
+    [] = filelib:wildcard(Log++".*"),
+
+    %% Stop/start handler and trun on rotation. Check that file is rotated.
+    {ok,#{config:=StdHConfig2}=HConfig2} = logger:get_handler_config(?MODULE),
+    ok = logger:remove_handler(?MODULE),
+    ok = logger:add_handler(
+           ?MODULE,logger_std_h,
+           HConfig2#{config=>StdHConfig2#{max_no_bytes=>100,
+                                          max_no_files=>2}}),
+    timer:sleep(100),
+    {ok,#file_info{size=0}} = file:read_file_info(Log),
+    {ok,#file_info{size=260}} = file:read_file_info(Log++".0"),
+    [_] = filelib:wildcard(Log++".*"),
+
+    %% Fill all logs
+    [logger:notice(Str,?domain) || _ <- lists:seq(1,10)],
+    logger_std_h:filesync(?MODULE),
+    {ok,#file_info{size=80}} = file:read_file_info(Log),
+    {ok,#file_info{size=120}} = file:read_file_info(Log++".0"),
+    {ok,#file_info{size=260}} = file:read_file_info(Log++".1"),
+
+    %% Stop/start handler, reduce count and turn on compression. Check
+    %% that excess archives are removed, and the rest compressed.
+    {ok,#{config:=StdHConfig3}=HConfig3} = logger:get_handler_config(?MODULE),
+    ok = logger:remove_handler(?MODULE),
+    ok = logger:add_handler(
+           ?MODULE,logger_std_h,
+           HConfig3#{config=>StdHConfig3#{max_no_bytes=>75,
+                                          max_no_files=>1,
+                                          compress_on_rotate=>true}}),
+    timer:sleep(500),
+    {ok,#file_info{size=0}} = file:read_file_info(Log),
+    {ok,#file_info{size=29}} = file:read_file_info(Log++".0.gz"),
+    [_] = filelib:wildcard(Log++".*"),
+
+    %% Stop/start handler and turn off compression. Check that achives
+    %% are decompressed.
+    {ok,#{config:=StdHConfig4}=HConfig4} = logger:get_handler_config(?MODULE),
+    ok = logger:remove_handler(?MODULE),
+    ok = logger:add_handler(
+           ?MODULE,logger_std_h,
+           HConfig4#{config=>StdHConfig4#{compress_on_rotate=>false}}),
+    timer:sleep(100),
+    {ok,#file_info{size=0}} = file:read_file_info(Log),
+    {ok,#file_info{size=80}} = file:read_file_info(Log++".0"),
+    [_] = filelib:wildcard(Log++".*"),
+
+    ok.
+rotation_opts_restart_handler(cleanup,_Config) ->
+    ok = stop_handler(?MODULE).
+
 %%%-----------------------------------------------------------------
 %%%
 send_requests(TO, Reqs = [{Mod,Func,Args,Res}|Rs]) ->
@@ -1289,27 +1816,34 @@ start_handler(Name, TTY, _Config) when TTY == standard_io;
     ok = logger:add_handler(Name,
                             logger_std_h,
                             #{config => #{type => TTY},
-                              filter_default=>log,
-                              filters=>?DEFAULT_HANDLER_FILTERS([Name]),
+                              filter_default=>stop,
+                              filters=>filter_only_this_domain(Name),
                               formatter=>{?MODULE,op}}),
     {ok,HConfig = #{config := StdHConfig}} = logger:get_handler_config(Name),
     {HConfig,StdHConfig};
 
 start_handler(Name, FuncName, Config) ->
-    Dir = ?config(priv_dir,Config),
-    Log = filename:join(Dir, lists:concat([FuncName,".log"])),
+    Log = get_handler_log_name(FuncName, Config),
     ct:pal("Logging to ~tp", [Log]),
     Type = {file,Log},
     _ = file_delete(Log),
     ok = logger:add_handler(Name,
                             logger_std_h,
                             #{config => #{type => Type},
-                              filter_default=>log,
-                              filters=>?DEFAULT_HANDLER_FILTERS([Name]),
+                              filter_default=>stop,
+                              filters=>filter_only_this_domain(Name),
                               formatter=>{?MODULE,op}}),
     {ok,HConfig = #{config := StdHConfig}} = logger:get_handler_config(Name),
     {Log,HConfig,StdHConfig}.
-    
+
+get_handler_log_name(FuncName, Config) ->
+    Dir = ?config(priv_dir,Config),
+    filename:join(Dir, lists:concat([FuncName,".log"])).
+
+filter_only_this_domain(Name) ->
+    [{remote_gl,{fun logger_filters:remote_gl/2,stop}},
+     {domain,{fun logger_filters:domain/2,{log,super,[Name]}}}].
+
 stop_handler(Name) ->
     R = logger:remove_handler(Name),
     ct:pal("Handler ~p stopped! Result: ~p", [Name,R]),
@@ -1322,6 +1856,8 @@ count_lines(File) ->
 wait_until_written(File, Sz) ->
     timer:sleep(2000),
     case file:read_file_info(File) of
+        {error,enoent} when Sz == -1 ->
+            wait_until_written(File, Sz);
         {ok,#file_info{size = Sz}} ->
             timer:sleep(1000),
             case file:read_file_info(File) of
@@ -1550,7 +2086,7 @@ start_op_trace() ->
     TRecvPid.
     
 stop_op_trace(TRecvPid) ->
-    dbg:stop_clear(),
+    stop_clear(),
     unlink(TRecvPid),
     exit(TRecvPid, kill),
     ok.
@@ -1617,7 +2153,7 @@ start_tracer(Trace,Expected) ->
                            maps:get(handler_state,
                                     maps:get(cb_state,
                                              logger_olp:info(h_proc_name())))),
-    dbg:tracer(process,{fun tracer/2,{Pid,Expected}}),
+    {ok,_} = dbg:tracer(process,{fun tracer/2,{Pid,Expected}}),
     dbg:p(whereis(h_proc_name()),[c]),
     dbg:p(FileCtrlPid,[c]),
     tpl(Trace),
@@ -1631,7 +2167,7 @@ tpl([{{M,F,A},MS}|Trace]) ->
         {_,_,1} ->
             ok;
         _ ->
-            dbg:stop_clear(),
+            stop_clear(),
             throw({skip,"Can't trace "++atom_to_list(M)++":"++
                        atom_to_list(F)++"/"++integer_to_list(A)})
     end,
@@ -1639,10 +2175,16 @@ tpl([{{M,F,A},MS}|Trace]) ->
 tpl([]) ->
     ok.
 
+stop_clear() ->
+    dbg:stop_clear(),
+    %% Remove tracer from all processes in order to eliminate
+    %% race conditions.
+    erlang:trace(all,false,[all]).
+
 tracer({trace,_,call,{logger_h_common,handle_cast,[Op|_]}},
        {Pid,[{Mod,Func,Op}|Expected]}) ->
     maybe_tracer_done(Pid,Expected,{Mod,Func,Op});
-tracer({trace,_,call,{Mod=logger_std_h,Func=write_to_dev,[_,Data,_,_,_]}},
+tracer({trace,_,call,{Mod=logger_std_h,Func=write_to_dev,[Data,_]}},
        {Pid,[{Mod,Func,Data}|Expected]}) ->
     maybe_tracer_done(Pid,Expected,{Mod,Func,Data});
 tracer({trace,_,call,{Mod,Func,_}}, {Pid,[{Mod,Func}|Expected]}) ->
@@ -1673,17 +2215,21 @@ check_tracer(T,TimeoutFun) ->
             %% traces are received
             check_tracer(Delay,fun() -> ok end);
         {tracer_got_unexpected,Got,Expected} ->
-            dbg:stop_clear(),
+            stop_clear(),
             ct:fail({tracer_got_unexpected,Got,Expected})
     after T ->
-            dbg:stop_clear(),
+            stop_clear(),
             TimeoutFun()
     end.
 
-escape([$+|Rest]) ->
-    [$\\,$+|escape(Rest)];
-escape([H|T]) ->
-    [H|escape(T)];
+escape([C|Rest]) ->
+    %% The characters that have to be escaped in a regex
+    case lists:member(C,"[-[\]{}()*+?.,\\^$|#\s]") of
+        true ->
+            [$\\,C|escape(Rest)];
+        false ->
+            [C|escape(Rest)]
+    end;
 escape([]) ->
     [].
 
@@ -1726,4 +2272,3 @@ filesync_rep_int() ->
 
 file_delete(Log) ->
    file:delete(Log).
-

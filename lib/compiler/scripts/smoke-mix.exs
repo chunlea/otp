@@ -25,6 +25,14 @@ defmodule Smoke.MixProject do
 	[
 	  {:bear, "~> 0.8.7"},
 	  {:cloudi_core, "~> 1.7"},
+	  {:cloudi_service_monitoring, "~> 1.7"},
+	  {:cloudi_service_tcp, "~> 1.7"},
+	  {:cloudi_service_queue, "~> 1.7"},
+	  {:cloudi_service_udp, "~> 1.7"},
+	  {:cloudi_service_map_reduce, "~> 1.7"},
+	  {:cloudi_service_api_requests, "~> 1.7"},
+	  {:cloudi_service_router, "~> 1.7"},
+	  {:cloudi_service_request_rate, "~> 1.7"},
 	  {:concuerror, "~> 0.20.0"},
 	  {:cowboy, "~> 2.6.1"},
 	  {:ecto, "~> 3.0.6"},
@@ -37,6 +45,7 @@ defmodule Smoke.MixProject do
 	  {:gpb, "~> 4.6"},
 	  {:gproc, "~> 0.8.0"},
 	  {:graphql, "~> 0.15.0", hex: :graphql_erl},
+	  {:hut, "~> 1.3"},
 	  {:hackney, "~> 1.15.0"},
 	  {:ibrowse, "~> 4.4.1"},
 	  {:jose, "~> 1.9.0"},
@@ -81,12 +90,13 @@ defmodule Smoke.MixProject do
 
   defp build_wings do
     # If the Erlang system is not installed, the build will
-    # crash in plugins_src/accel when attempting to build
-    # the accel driver. Since there is very little Erlang code in
-    # the directory, skip the entire directory.
+    # crash in c_src or plugins_src/accel when attempting to
+    # build native code. Since there is very little Erlang
+    # code in these directories, skip them both.
 
     """
     echo "all:\n\t" >plugins_src/accel/Makefile
+    echo "all:\n\t" >c_src/Makefile
     git commit -a -m'Disable for smoke testing'
     git tag -a -m'Smoke test' vsmoke_test
     make

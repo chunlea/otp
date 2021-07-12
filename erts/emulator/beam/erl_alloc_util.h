@@ -1,7 +1,7 @@
 /*
  * %CopyrightBegin%
  *
- * Copyright Ericsson AB 2002-2018. All Rights Reserved.
+ * Copyright Ericsson AB 2002-2020. All Rights Reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -53,6 +53,8 @@ typedef struct {
     int tpref;
     int ramv;
     int atags;
+    int cp;
+    int mmbc0;     /* create main mbc for instance 0 */
     UWord sbct;
     UWord asbcst;
     UWord rsbcst;
@@ -111,6 +113,8 @@ typedef struct {
     0,			/* (bool)   tpref:  thread preferred             */\
     0,			/* (bool)   ramv:   realloc always moves         */\
     0,			/* (bool)   atags:  tagged allocations           */\
+    -1,		        /* (ix)     cp:     carrier pool                 */\
+    1,                  /* (bool)   mmbc0:  main mbc in instance 0       */\
     512*1024,		/* (bytes)  sbct:   sbc threshold                */\
     2*1024*2024,	/* (amount) asbcst: abs sbc shrink threshold     */\
     20,			/* (%)      rsbcst: rel sbc shrink threshold     */\
@@ -149,10 +153,13 @@ typedef struct {
     0,			/* (bool)   tpref:  thread preferred             */\
     0,			/* (bool)   ramv:   realloc always moves         */\
     0,			/* (bool)   atags:  tagged allocations           */\
+    -1,		        /* (ix)     cp:     carrier pool                 */\
+    1,                  /* (bool)   mmbc0:  main mbc in instance 0       */\
     64*1024,		/* (bytes)  sbct:   sbc threshold                */\
     2*1024*2024,	/* (amount) asbcst: abs sbc shrink threshold     */\
     20,			/* (%)      rsbcst: rel sbc shrink threshold     */\
     80,			/* (%)      rsbcmt: rel sbc move threshold       */\
+    50,			/* (%)      rmbcmt: rel mbc move threshold       */\
     128*1024,		/* (bytes)  mmbcs:  main multiblock carrier size */\
     256,		/* (amount) mmsbc:  max mseg sbcs                */\
     ~((UWord) 0),	/* (amount) mmmbc:  max mseg mbcs                */ \
@@ -211,12 +218,6 @@ void  erts_alcu_literal_32_mseg_dealloc(Allctr_t*, void *seg, Uint size, Uint fl
 void* erts_alcu_mmapper_mseg_alloc(Allctr_t*, Uint *size_p, Uint flags);
 void* erts_alcu_mmapper_mseg_realloc(Allctr_t*, void *seg, Uint old_size, Uint *new_size_p);
 void  erts_alcu_mmapper_mseg_dealloc(Allctr_t*, void *seg, Uint size, Uint flags);
-# endif
-
-# if defined(ERTS_ALC_A_EXEC)
-void* erts_alcu_exec_mseg_alloc(Allctr_t*, Uint *size_p, Uint flags);
-void* erts_alcu_exec_mseg_realloc(Allctr_t*, void *seg, Uint old_size, Uint *new_size_p);
-void  erts_alcu_exec_mseg_dealloc(Allctr_t*, void *seg, Uint size, Uint flags);
 # endif
 #endif /* HAVE_ERTS_MSEG */
 
@@ -309,7 +310,7 @@ void erts_alcu_sched_spec_data_init(struct ErtsSchedulerData_ *esdp);
 #  ifdef MSEG_ALIGN_BITS
 #    define ERTS_SUPER_ALIGN_BITS MSEG_ALIGN_BITS
 #  else
-#    define ERTS_SUPER_ALIGN_BITS 18
+#    define ERTS_SUPER_ALIGN_BITS ERTS_MMAP_SUPERALIGNED_BITS
 #  endif
 #  ifdef ARCH_64 
 #    define MBC_ABLK_OFFSET_BITS   23
@@ -334,8 +335,11 @@ void erts_alcu_sched_spec_data_init(struct ErtsSchedulerData_ *esdp);
 #endif
 
 #if MBC_ABLK_OFFSET_BITS
-#  define MBC_ABLK_OFFSET_SHIFT  (sizeof(UWord)*8 - MBC_ABLK_OFFSET_BITS)
-#  define MBC_ABLK_OFFSET_MASK   ((~((UWord)0) << MBC_ABLK_OFFSET_SHIFT) & ~BLK_FLG_MASK)
+/* The shift is reduced by 1 since the highest bit is used for a flag. */
+#  define MBC_ABLK_OFFSET_SHIFT  (sizeof(UWord)*8 - 1 - MBC_ABLK_OFFSET_BITS)
+#  define MBC_ABLK_OFFSET_MASK \
+    (((UWORD_CONSTANT(1) << MBC_ABLK_OFFSET_BITS) - UWORD_CONSTANT(1)) \
+     << MBC_ABLK_OFFSET_SHIFT)
 #  define MBC_ABLK_SZ_MASK	(~MBC_ABLK_OFFSET_MASK & ~BLK_FLG_MASK)
 #else
 #  define MBC_ABLK_SZ_MASK	(~BLK_FLG_MASK)
@@ -440,6 +444,24 @@ struct AOFF_RBTree_t_ {
     } u;
 };
 
+#if ERTS_ALC_A_INVALID != 0
+#  error "Carrier pool implementation assumes ERTS_ALC_A_INVALID == 0"
+#endif
+#if ERTS_ALC_A_MIN <= ERTS_ALC_A_INVALID
+#  error "Carrier pool implementation assumes ERTS_ALC_A_MIN > ERTS_ALC_A_INVALID"
+#endif
+
+/* The pools are only allowed to be manipulated by managed threads except in
+ * the alloc_SUITE:cpool test, where only ERTS_ALC_TEST_CPOOL_IX pool is used. */
+
+#define ERTS_ALC_TEST_CPOOL_IX ERTS_ALC_A_INVALID
+/*
+ * System is not an alloc_util allocator, so we use its slot for
+ * the common cpool...
+ */
+#define ERTS_ALC_COMMON_CPOOL_IX ERTS_ALC_A_SYSTEM
+#define ERTS_ALC_NO_CPOOLS (ERTS_ALC_A_MAX+1)
+
 void aoff_add_pooled_mbc(Allctr_t*, Carrier_t*);
 void aoff_remove_pooled_mbc(Allctr_t*, Carrier_t*);
 Carrier_t* aoff_lookup_pooled_mbc(Allctr_t*, Uint size);
@@ -453,8 +475,8 @@ typedef struct {
     ErtsThrPrgrVal thr_prgr;
     erts_atomic_t max_size;
     UWord abandon_limit;
-    UWord blocks[ERTS_ALC_A_MAX + 1];
-    UWord blocks_size[ERTS_ALC_A_MAX + 1];
+    UWord blocks[ERTS_ALC_A_COUNT];
+    UWord blocks_size[ERTS_ALC_A_COUNT];
     UWord total_blocks_size;
     enum {
         ERTS_MBC_IS_HOME,
@@ -489,30 +511,57 @@ typedef struct {
 } StatValues_t;
 
 typedef struct {
-    union {
-	struct {
-	    StatValues_t	mseg;
-	    StatValues_t	sys_alloc;
-	} norm;
-    } curr;
-    StatValues_t	max;
-    StatValues_t	max_ever;
-    struct {
-	StatValues_t	curr;
-	StatValues_t	max;
-	StatValues_t	max_ever;
-    } blocks;
+    StatValues_t curr;
+    StatValues_t max;
+    StatValues_t max_ever;
+} BlockStats_t;
+
+enum {
+    ERTS_CRR_ALLOC_MIN = 0,
+
+    ERTS_CRR_ALLOC_MSEG = ERTS_CRR_ALLOC_MIN,
+    ERTS_CRR_ALLOC_SYS = 1,
+
+    ERTS_CRR_ALLOC_MAX,
+    ERTS_CRR_ALLOC_COUNT = ERTS_CRR_ALLOC_MAX + 1
+};
+
+typedef struct {
+    StatValues_t    carriers[ERTS_CRR_ALLOC_COUNT];
+
+    StatValues_t    max;
+    StatValues_t    max_ever;
+
+    BlockStats_t    blocks[ERTS_ALC_A_COUNT];
 } CarriersStats_t;
 
 #ifdef USE_LTTNG_VM_TRACEPOINTS
-#define LTTNG_CARRIER_STATS_TO_LTTNG_STATS(CSP, LSP)            \
-    do {                                                        \
-        (LSP)->carriers.size = (CSP)->curr.norm.mseg.size       \
-                             + (CSP)->curr.norm.sys_alloc.size; \
-        (LSP)->carriers.no   = (CSP)->curr.norm.mseg.no         \
-                             + (CSP)->curr.norm.sys_alloc.no;   \
-        (LSP)->blocks.size   = (CSP)->blocks.curr.size;         \
-        (LSP)->blocks.no     = (CSP)->blocks.curr.no;           \
+#define LTTNG_CARRIER_STATS_TO_LTTNG_STATS(CSP, LSP)                         \
+    do {                                                                     \
+        UWord no_sum__, size_sum__;                                          \
+        int alloc_no__, i__;                                                 \
+        /* Carrier counters */                                               \
+        no_sum__ = size_sum__ = 0;                                           \
+        for (i__ = ERTS_CRR_ALLOC_MIN; i__ <= ERTS_CRR_ALLOC_MAX; i__++) {   \
+            StatValues_t *curr__ = &((CSP)->carriers[i__]);                  \
+            no_sum__ += curr__->no;                                          \
+            size_sum__ += curr__->size;                                      \
+        }                                                                    \
+        (LSP)->carriers.size = size_sum__;                                   \
+        (LSP)->carriers.no   = no_sum__;                                     \
+        /* Block counters */                                                 \
+        no_sum__ = size_sum__ = 0;                                           \
+        for (alloc_no__ = ERTS_ALC_A_MIN;                                    \
+             alloc_no__ <= ERTS_ALC_A_MAX;                                   \
+             alloc_no__++) {                                                 \
+            StatValues_t *curr__;                                            \
+            i__ = alloc_no__ - ERTS_ALC_A_MIN;                               \
+            curr__ = &((CSP)->blocks[i__].curr);                             \
+            no_sum__ += curr__->no;                                          \
+            size_sum__ += curr__->size;                                      \
+        }                                                                    \
+        (LSP)->blocks.size   = size_sum__;                                   \
+        (LSP)->blocks.no     = no_sum__;                                     \
     } while (0)
 #endif
 
@@ -627,7 +676,6 @@ struct Allctr_t_ {
     /* */
     Uint		mbc_header_size;
     Uint		min_mbc_size;
-    Uint		min_mbc_first_free_size;
     Uint		min_block_size;
     UWord               crr_set_flgs;
     UWord               crr_clr_flgs;
@@ -650,9 +698,10 @@ struct Allctr_t_ {
 	UWord		util_limit;       /* acul */
         UWord           in_pool_limit;    /* acnl */
         UWord           fblk_min_limit;   /* acmfl */
+        int             carrier_pool;     /* cp */
 	struct {
-	    erts_atomic_t	blocks_size[ERTS_ALC_A_MAX + 1];
-	    erts_atomic_t	no_blocks[ERTS_ALC_A_MAX + 1];
+	    erts_atomic_t	blocks_size[ERTS_ALC_A_COUNT];
+	    erts_atomic_t	no_blocks[ERTS_ALC_A_COUNT];
 	    erts_atomic_t	carriers_size;
 	    erts_atomic_t	no_carriers;
             CallCounter_t       fail_pooled;

@@ -1,7 +1,7 @@
 %%
 %% %CopyrightBegin%
 %% 
-%% Copyright Ericsson AB 2002-2018. All Rights Reserved.
+%% Copyright Ericsson AB 2002-2020. All Rights Reserved.
 %% 
 %% Licensed under the Apache License, Version 2.0 (the "License");
 %% you may not use this file except in compliance with the License.
@@ -19,6 +19,7 @@
 %%
 
 -module(erts_test_utils).
+-compile(r20).
 
 %%
 %% THIS MODULE IS ALSO USED BY *OTHER* APPLICATIONS TEST CODE
@@ -27,6 +28,7 @@
 -export([mk_ext_pid/3,
          mk_ext_port/2,
          mk_ext_ref/2,
+         available_internal_state/1,
          check_node_dist/0, check_node_dist/1, check_node_dist/3]).
 
 
@@ -41,6 +43,21 @@
 -define(NEW_PID_EXT,         $X).
 -define(NEW_PORT_EXT,        $Y).
 -define(NEWER_REFERENCE_EXT, $Z).
+-define(V4_PORT_EXT,         $x).
+
+-define(OLD_MAX_PIDS_PORTS, ((1 bsl 28) - 1)).
+
+uint64_be(Uint) when is_integer(Uint), 0 =< Uint, Uint < 1 bsl 64 ->
+    [(Uint bsr 56) band 16#ff,
+     (Uint bsr 48) band 16#ff,
+     (Uint bsr 40) band 16#ff,
+     (Uint bsr 32) band 16#ff,
+     (Uint bsr 24) band 16#ff,
+     (Uint bsr 16) band 16#ff,
+     (Uint bsr 8) band 16#ff,
+     Uint band 16#ff];
+uint64_be(Uint) ->
+    exit({badarg, uint64_be, [Uint]}).
 
 uint32_be(Uint) when is_integer(Uint), 0 =< Uint, Uint < 1 bsl 32 ->
     [(Uint bsr 24) band 16#ff,
@@ -49,7 +66,6 @@ uint32_be(Uint) when is_integer(Uint), 0 =< Uint, Uint < 1 bsl 32 ->
      Uint band 16#ff];
 uint32_be(Uint) ->
     exit({badarg, uint32_be, [Uint]}).
-
 
 uint16_be(Uint) when is_integer(Uint), 0 =< Uint, Uint < 1 bsl 16 ->
     [(Uint bsr 8) band 16#ff,
@@ -89,19 +105,27 @@ mk_ext_pid({NodeName, Creation}, Number, Serial) ->
 	    exit({unexpected_binary_to_term_result, Other})
     end.
 
-port_tag(bad_creation) -> ?PORT_EXT;
-port_tag(Creation) when Creation =< 3 -> ?PORT_EXT;
-port_tag(_Creation) -> ?NEW_PORT_EXT.
+port_tag(_Num, bad_creation) ->
+    ?PORT_EXT;
+port_tag(Num, Creation) when 0 =< Num, Num =< ?OLD_MAX_PIDS_PORTS, Creation =< 3 ->
+    ?PORT_EXT;
+port_tag(Num, _Creation) when 0 =< Num, Num =< ?OLD_MAX_PIDS_PORTS ->
+    ?NEW_PORT_EXT;
+port_tag(_Num, _Creation) ->
+    ?V4_PORT_EXT.
 
 mk_ext_port({NodeName, Creation}, Number) when is_atom(NodeName) ->
     mk_ext_port({atom_to_list(NodeName), Creation}, Number);
 mk_ext_port({NodeName, Creation}, Number) ->
     case catch binary_to_term(list_to_binary([?VERSION_MAGIC,
-					      port_tag(Creation),
+					      port_tag(Number, Creation),
 					      ?ATOM_EXT,
 					      uint16_be(length(NodeName)),
 					      NodeName,
-					      uint32_be(Number),
+					      case Number > ?OLD_MAX_PIDS_PORTS of
+						  true -> uint64_be(Number);
+						  false -> uint32_be(Number)
+					      end,
 					      enc_creation(Creation)])) of
 	Port when is_port(Port) ->
 	    Port;
@@ -157,6 +181,21 @@ mk_ext_ref({NodeName, Creation}, Numbers) when is_list(NodeName),
     end.
 
 
+available_internal_state(Bool) when Bool == true; Bool == false ->
+    case {Bool,
+          (catch erts_debug:get_internal_state(available_internal_state))} of
+        {true, true} ->
+            true;
+        {false, true} ->
+            erts_debug:set_internal_state(available_internal_state, false),
+            true;
+        {true, _} ->
+            erts_debug:set_internal_state(available_internal_state, true),
+            false;
+        {false, _} ->
+            false
+    end.
+
 
 %%
 %% Check reference counters for node- and dist entries.
@@ -168,16 +207,21 @@ check_node_dist() ->
                     end).
 
 check_node_dist(Fail) ->
+    AIS = available_internal_state(true),
+    [erlang:garbage_collect(P) || P <- erlang:processes()],
     {{node_references, NodeRefs},
      {dist_references, DistRefs}} =
         erts_debug:get_internal_state(node_and_dist_references),
-    check_node_dist(Fail, NodeRefs, DistRefs).
-
-
+    R = check_node_dist(Fail, NodeRefs, DistRefs),
+    available_internal_state(AIS),
+    R.
 
 check_node_dist(Fail, NodeRefs, DistRefs) ->
-    check_nd_refc({node(),erlang:system_info(creation)},                  
-                  NodeRefs, DistRefs, Fail).
+    AIS = available_internal_state(true),
+    R = check_nd_refc({node(),erlang:system_info(creation)},
+                  NodeRefs, DistRefs, Fail),
+    available_internal_state(AIS),
+    R.
 
 
 check_nd_refc({ThisNodeName, ThisCreation}, NodeRefs, DistRefs, Fail) ->

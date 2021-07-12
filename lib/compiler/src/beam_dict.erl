@@ -1,7 +1,7 @@
 %%
 %% %CopyrightBegin%
 %% 
-%% Copyright Ericsson AB 1998-2016. All Rights Reserved.
+%% Copyright Ericsson AB 1998-2020. All Rights Reserved.
 %% 
 %% Licensed under the Apache License, Version 2.0 (the "License");
 %% you may not use this file except in compliance with the License.
@@ -36,10 +36,11 @@
 -type import_tab() :: gb_trees:tree(mfa(), index()).
 -type fname_tab()  :: #{Name :: term() => index()}.
 -type line_tab()   :: #{{Fname :: index(), Line :: term()} => index()}.
--type literal_tab() :: dict:dict(Literal :: term(), index()).
+-type literal_tab() :: #{Literal :: term() => index()}.
 
 -type lambda_info() :: {label(),{index(),label(),non_neg_integer()}}.
 -type lambda_tab() :: {non_neg_integer(),[lambda_info()]}.
+-type wrapper() :: #{label() => index()}.
 
 -record(asm,
 	{atoms = #{}                :: atom_tab(),
@@ -48,7 +49,8 @@
 	 imports = gb_trees:empty() :: import_tab(),
 	 strings = <<>>		    :: binary(),	%String pool
 	 lambdas = {0,[]}           :: lambda_tab(),
-	 literals = dict:new()	    :: literal_tab(),
+         wrappers = #{}             :: wrapper(),
+	 literals = #{}	            :: literal_tab(),
 	 fnames = #{}               :: fname_tab(),
 	 lines = #{}                :: line_tab(),
 	 num_lines = 0		    :: non_neg_integer(), %Number of line instructions
@@ -147,22 +149,48 @@ string(BinString, Dict) when is_binary(BinString) ->
 -spec lambda(label(), non_neg_integer(), bdict()) ->
         {non_neg_integer(), bdict()}.
 
-lambda(Lbl, NumFree, #asm{lambdas={OldIndex,Lambdas0}}=Dict) ->
-    %% Set Index the same as OldIndex.
-    Index = OldIndex,
-    Lambdas = [{Lbl,{Index,Lbl,NumFree}}|Lambdas0],
-    {OldIndex,Dict#asm{lambdas={OldIndex+1,Lambdas}}}.
+lambda(Lbl, NumFree, #asm{wrappers=Wrappers0,
+                          lambdas={OldIndex,Lambdas0}}=Dict) ->
+    case Wrappers0 of
+        #{Lbl:=Index} ->
+            %% OTP 23: There old is a fun entry for this wrapper function.
+            %% Share the fun entry.
+            {Index,Dict};
+        #{} ->
+            %% Set Index the same as OldIndex.
+            Index = OldIndex,
+            Wrappers = Wrappers0#{Lbl=>Index},
+            Lambdas = [{Lbl,{Index,Lbl,NumFree}}|Lambdas0],
+            {OldIndex,Dict#asm{wrappers=Wrappers,
+                               lambdas={OldIndex+1,Lambdas}}}
+    end.
 
 %% Returns the index for a literal (adding it to the literal table if necessary).
 %%    literal(Literal, Dict) -> {Index,Dict'}
 -spec literal(term(), bdict()) -> {non_neg_integer(), bdict()}.
 
-literal(Lit, #asm{literals=Tab0,next_literal=NextIndex}=Dict) ->
-    case dict:find(Lit, Tab0) of
-	{ok,Index} ->
+-dialyzer({no_improper_lists, literal/2}).
+
+literal(Lit, Dict) when is_float(Lit) ->
+    %% A literal 0.0 actually has two representations: 0.0 and -0.0.
+    %% While they are equal, they must be encoded differently (the bit sign).
+    if
+        %% We do not explicitly match on 0.0 because a buggy compiler
+        %% could replace Lit by 0.0, which would discard its sign.
+        Lit > 0.0; Lit < 0.0 ->
+            literal1([term|Lit], Dict);
+        true ->
+            literal1([binary|my_term_to_binary(Lit)], Dict)
+    end;
+literal(Lit, Dict) ->
+    literal1([term|Lit], Dict).
+
+literal1(Key, #asm{literals=Tab0,next_literal=NextIndex}=Dict) ->
+    case Tab0 of
+        #{Key:=Index} ->
 	    {Index,Dict};
-	error ->
-	    Tab = dict:store(Lit, NextIndex, Tab0),
+        #{} ->
+	    Tab = Tab0#{Key=>NextIndex},
 	    {NextIndex,Dict#asm{literals=Tab,next_literal=NextIndex+1}}
     end.
 
@@ -174,7 +202,7 @@ line([], #asm{num_lines=N}=Dict) ->
     %% No location available. Return the special pre-defined
     %% index 0.
     {0,Dict#asm{num_lines=N+1}};
-line([{location,Name,Line}], #asm{lines=Lines,num_lines=N}=Dict0) ->
+line([{location,Name,Line}|_], #asm{lines=Lines,num_lines=N}=Dict0) ->
     {FnameIndex,Dict1} = fname(Name, Dict0),
     Key = {FnameIndex,Line},
     case Lines of
@@ -182,7 +210,9 @@ line([{location,Name,Line}], #asm{lines=Lines,num_lines=N}=Dict0) ->
         _ ->
 	    Index = maps:size(Lines) + 1,
             {Index, Dict1#asm{lines=Lines#{Key=>Index},num_lines=N+1}}
-    end.
+    end;
+line([_|T], #asm{}=Dict) ->
+    line(T, Dict).
 
 -spec fname(nonempty_string(), bdict()) ->
                    {non_neg_integer(), bdict()}.
@@ -209,14 +239,14 @@ atom_table(#asm{atoms=Atoms}, Encoding) ->
 
 %% Returns the table of local functions.
 %%    local_table(Dict) -> {NumLocals, [{Function, Arity, Label}...]}
--spec local_table(bdict()) -> {non_neg_integer(), [{label(),arity(),label()}]}.
+-spec local_table(bdict()) -> {non_neg_integer(), [{index(),arity(),label()}]}.
 
 local_table(#asm{locals = Locals}) ->
     {length(Locals),Locals}.
 
 %% Returns the export table.
 %%    export_table(Dict) -> {NumExports, [{Function, Arity, Label}...]}
--spec export_table(bdict()) -> {non_neg_integer(), [{label(),arity(),label()}]}.
+-spec export_table(bdict()) -> {non_neg_integer(), [{index(),arity(),label()}]}.
 
 export_table(#asm{exports = Exports}) ->
     {length(Exports),Exports}.
@@ -253,15 +283,23 @@ lambda_table(#asm{locals=Loc0,lambdas={NumLambdas,Lambdas0}}) ->
 -spec literal_table(bdict()) -> {non_neg_integer(), [[binary(),...]]}.
 
 literal_table(#asm{literals=Tab,next_literal=NumLiterals}) ->
-    L0 = dict:fold(fun(Lit, Num, Acc) ->
-			   [{Num,my_term_to_binary(Lit)}|Acc]
+    L0 = maps:fold(fun
+			([term|Lit], Num, Acc) ->
+			   [{Num,my_term_to_binary(Lit)}|Acc];
+			([binary|Lit], Num, Acc) ->
+			   [{Num,Lit}|Acc]
 		   end, [], Tab),
     L1 = lists:sort(L0),
     L = [[<<(byte_size(Term)):32>>,Term] || {_,Term} <- L1],
     {NumLiterals,L}.
 
 my_term_to_binary(Term) ->
-    term_to_binary(Term, [{minor_version,1}]).
+    %% Use the latest possible minor version. Minor version 2 can be
+    %% be decoded by OTP 16, which is as far back as we have compatibility
+    %% options for the compiler. (When this comment was written, some time
+    %% after the release of OTP 22, the default minor version was 1.)
+
+    term_to_binary(Term, [{minor_version,2}]).
 
 %% Return the line table.
 -spec line_table(bdict()) ->

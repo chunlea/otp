@@ -24,7 +24,7 @@ ifeq ($(OVERRIDE_TARGET),)
 
 ifeq ($(TARGET),)
 
-TARGET := $(shell $(ERL_TOP)/erts/autoconf/config.guess)
+TARGET := $(shell $(ERL_TOP)/make/autoconf/config.guess)
 
 else
 
@@ -55,10 +55,7 @@ endif
 
 ifneq ($(TARGET),)
 ifneq ($(TARGET),win32)
-ifneq ($(findstring vxworks,$(TARGET)),vxworks)
-override TARGET := $(shell $(ERL_TOP)/erts/autoconf/config.sub $(TARGET))
-else
-endif
+override TARGET := $(shell $(ERL_TOP)/make/autoconf/config.sub $(TARGET))
 else
 endif
 else

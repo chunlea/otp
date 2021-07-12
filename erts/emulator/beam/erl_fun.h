@@ -26,28 +26,23 @@
 /*
  * Fun entry.
  */
-
 typedef struct erl_fun_entry {
-    HashBucket bucket;		/* MUST BE LOCATED AT TOP OF STRUCT!!! */
+    HashBucket bucket;
 
-    byte uniq[16];		/* MD5 for module. */
-    int index;			/* New style index. */
-    int old_uniq;		/* Unique number (old_style) */
-    int old_index;		/* Old style index */
-    BeamInstr* address;		/* Pointer to code for fun */
+    ErtsCodePtr address;            /* Pointer to code for actual function */
 
-#ifdef HIPE
-    UWord* native_address;	/* Native entry code for fun. */
-#endif
+    /* These fields identify the function and must not be altered after fun
+     * creation. */
+    Eterm module;                   /* Tagged atom for module. */
+    Uint arity;                     /* The arity of the fun. */
+    int index;                      /* New style index. */
+    byte uniq[16];                  /* MD5 for module. */
+    int old_uniq;                   /* Unique number (old_style) */
+    int old_index;                  /* Old style index */
 
-    Uint arity;			/* The arity of the fun. */
-    Eterm module;		/* Tagged atom for module. */
-    erts_refc_t refc;		/* Reference count: One for code + one for each
-				   fun object in each process. */
-    BeamInstr *pend_purge_address; /* address stored during a pending purge */
-#ifdef HIPE
-    UWord* pend_purge_native_address;
-#endif
+    erts_refc_t refc;               /* Reference count: One for code + one for
+                                     * each fun object in each process. */
+    ErtsCodePtr pend_purge_address; /* Address during a pending purge */
 } ErlFunEntry;
 
 /*
@@ -74,15 +69,19 @@ void erts_init_fun_table(void);
 void erts_fun_info(fmtfn_t, void *);
 int erts_fun_table_sz(void);
 
-ErlFunEntry* erts_put_fun_entry(Eterm mod, int uniq, int index);
-ErlFunEntry* erts_get_fun_entry(Eterm mod, int uniq, int index);
-
+/* Finds or inserts a fun entry that matches the given signature. */
 ErlFunEntry* erts_put_fun_entry2(Eterm mod, int old_uniq, int old_index,
-				byte* uniq, int index, int arity);
+                                 const byte* uniq, int index, int arity);
+
+const ErtsCodeMFA *erts_get_fun_mfa(const ErlFunEntry *fe);
+
+int erts_is_fun_loaded(const ErlFunEntry* fe);
 
 void erts_erase_fun_entry(ErlFunEntry* fe);
 void erts_cleanup_funs(ErlFunThing* funp);
-void erts_fun_purge_prepare(BeamInstr* start, BeamInstr* end);
+
+struct erl_module_instance;
+void erts_fun_purge_prepare(struct erl_module_instance* modi);
 void erts_fun_purge_abort_prepare(ErlFunEntry **funs, Uint no);
 void erts_fun_purge_abort_finalize(ErlFunEntry **funs, Uint no);
 void erts_fun_purge_complete(ErlFunEntry **funs, Uint no);

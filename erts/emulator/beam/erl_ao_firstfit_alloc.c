@@ -1,7 +1,7 @@
 /*
  * %CopyrightBegin%
  * 
- * Copyright Ericsson AB 2003-2018. All Rights Reserved.
+ * Copyright Ericsson AB 2003-2020. All Rights Reserved.
  * 
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -67,7 +67,6 @@
 #endif
 
 #define MIN_MBC_SZ		(16*1024)
-#define MIN_MBC_FIRST_FREE_SZ	(4*1024)
 
 #define TREE_NODE_FLG		(((Uint) 1) << 0)
 #define RED_FLG			(((Uint) 1) << 1)
@@ -100,8 +99,8 @@
 
 #define AOFF_BLK_SZ(B) MBC_FBLK_SZ(&(B)->hdr)
 
-#define LIST_NEXT(N) (((AOFF_RBTree_t*)(N))->u.next)
-#define LIST_PREV(N) (((AOFF_RBTree_t*)(N))->parent)
+#define AOFF_LIST_NEXT(N) (((AOFF_RBTree_t*)(N))->u.next)
+#define AOFF_LIST_PREV(N) (((AOFF_RBTree_t*)(N))->parent)
 
 typedef struct AOFF_Carrier_t_ AOFF_Carrier_t;
 
@@ -154,13 +153,13 @@ static ERTS_INLINE Uint node_max_size(AOFF_RBTree_t *x)
 static ERTS_INLINE void lower_max_size(AOFF_RBTree_t *node,
 				       AOFF_RBTree_t* stop_at)
 {
-    AOFF_RBTree_t* x = node;    
+    AOFF_RBTree_t* x = node;
     Uint old_max = x->max_sz;
     Uint new_max = node_max_size(x);
 
     if (new_max < old_max) {
 	x->max_sz = new_max;
-	while ((x=x->parent) != stop_at && x->max_sz == old_max) {		
+	while ((x=x->parent) != stop_at && x->max_sz == old_max) {
 	    x->max_sz = node_max_size(x);
 	}
 	ASSERT(x == stop_at || x->max_sz > old_max);
@@ -306,7 +305,6 @@ erts_aoffalc_start(AOFFAllctr_t *alc,
     alc->crr_order                      = aoffinit->crr_order;
     allctr->mbc_header_size		= sizeof(AOFF_Carrier_t);
     allctr->min_mbc_size		= MIN_MBC_SZ;
-    allctr->min_mbc_first_free_size	= MIN_MBC_FIRST_FREE_SZ;
     allctr->min_block_size              = sizeof(AOFF_RBTree_t);
 
     allctr->vsn_str			= ERTS_ALC_AOFF_ALLOC_VSN_STR;
@@ -372,7 +370,7 @@ left_rotate(AOFF_RBTree_t **root, AOFF_RBTree_t *x)
     x->parent = y;
 
     y->max_sz = x->max_sz;
-    x->max_sz = node_max_size(x); 
+    x->max_sz = node_max_size(x);
     ASSERT(y->max_sz >= x->max_sz);
 }
 
@@ -397,7 +395,7 @@ right_rotate(AOFF_RBTree_t **root, AOFF_RBTree_t *x)
     y->right = x;
     x->parent = y;
     y->max_sz = x->max_sz;
-    x->max_sz = node_max_size(x);    
+    x->max_sz = node_max_size(x);
     ASSERT(y->max_sz >= x->max_sz);
 }
 
@@ -544,23 +542,23 @@ aoff_unlink_free_block(Allctr_t *allctr, Block_t *blk)
 	ASSERT(del->flags & IS_BF_FLG);
 	if (IS_LIST_ELEM(del)) {
 	    /* Remove from list */
-	    ASSERT(LIST_PREV(del));
-	    ASSERT(LIST_PREV(del)->flags & IS_BF_FLG);
-	    LIST_NEXT(LIST_PREV(del)) = LIST_NEXT(del);
-	    if (LIST_NEXT(del)) {
-		ASSERT(LIST_NEXT(del)->flags & IS_BF_FLG);
-		LIST_PREV(LIST_NEXT(del)) = LIST_PREV(del);
+	    ASSERT(AOFF_LIST_PREV(del));
+	    ASSERT(AOFF_LIST_PREV(del)->flags & IS_BF_FLG);
+	    AOFF_LIST_NEXT(AOFF_LIST_PREV(del)) = AOFF_LIST_NEXT(del);
+	    if (AOFF_LIST_NEXT(del)) {
+		ASSERT(AOFF_LIST_NEXT(del)->flags & IS_BF_FLG);
+		AOFF_LIST_PREV(AOFF_LIST_NEXT(del)) = AOFF_LIST_PREV(del);
 	    }
 	    return;
 	}
-	else if (LIST_NEXT(del)) {
+	else if (AOFF_LIST_NEXT(del)) {
 	    /* Replace tree node by next element in list... */
 	    
-	    ASSERT(AOFF_BLK_SZ(LIST_NEXT(del)) == AOFF_BLK_SZ(del));
-	    ASSERT(IS_LIST_ELEM(LIST_NEXT(del)));
-	    
-	    replace(&crr->root, (AOFF_RBTree_t*)del, LIST_NEXT(del));
-	    
+	    ASSERT(AOFF_BLK_SZ(AOFF_LIST_NEXT(del)) == AOFF_BLK_SZ(del));
+	    ASSERT(IS_LIST_ELEM(AOFF_LIST_NEXT(del)));
+
+	    replace(&crr->root, (AOFF_RBTree_t*)del, AOFF_LIST_NEXT(del));
+
 	    HARD_CHECK_TREE(&crr->crr, crr->blk_order, crr->root, 0);
 	    return;
 	}
@@ -571,13 +569,13 @@ aoff_unlink_free_block(Allctr_t *allctr, Block_t *blk)
     HARD_CHECK_TREE(&crr->crr, crr->blk_order, crr->root, 0);
 
     /* Update the carrier tree with a potentially new (lower) max_sz
-     */    
+     */
     if (crr->root) {
 	if (crr->rbt_node.hdr.bhdr == crr->root->max_sz) {
 	    return;
 	}
 	ASSERT(crr->rbt_node.hdr.bhdr > crr->root->max_sz);
-	crr->rbt_node.hdr.bhdr = crr->root->max_sz; 
+	crr->rbt_node.hdr.bhdr = crr->root->max_sz;
     }
     else {
 	crr->rbt_node.hdr.bhdr = 0;
@@ -603,9 +601,11 @@ rbt_delete(AOFF_RBTree_t** root, AOFF_RBTree_t* del)
     /* Find node to splice out */
     if (!z->left || !z->right)
 	y = z;
-    else
+    else {
 	/* Set y to z:s successor */
-	for(y = z->right; y->left; y = y->left);
+	for(y = z->right; y->left; y = y->left)
+	    ;
+    }
     /* splice out y */
     x = y->left ? y->left : y->right;
     spliced_is_black = IS_BLACK(y);
@@ -795,7 +795,7 @@ rbt_insert(enum AOFFSortOrder order, AOFF_RBTree_t** root, AOFF_RBTree_t* blk)
 #ifdef DEBUG
     blk->flags  = (order == FF_BF) ? IS_BF_FLG : 0;
 #else
-    blk->flags  = 0; 
+    blk->flags  = 0;
 #endif
     blk->left	= NULL;
     blk->right	= NULL;
@@ -809,7 +809,7 @@ rbt_insert(enum AOFFSortOrder order, AOFF_RBTree_t** root, AOFF_RBTree_t* blk)
     else {
 	AOFF_RBTree_t *x = *root;
 	while (1) {
-	    SWord diff; 
+	    SWord diff;
 	    if (x->max_sz < blk_sz) {
 		x->max_sz = blk_sz;
 	    }
@@ -832,14 +832,14 @@ rbt_insert(enum AOFFSortOrder order, AOFF_RBTree_t** root, AOFF_RBTree_t* blk)
 	    }
 	    else {
 		ASSERT(order == FF_BF);
-		ASSERT(blk->flags & IS_BF_FLG);			    
-		ASSERT(x->flags & IS_BF_FLG);			    
+		ASSERT(blk->flags & IS_BF_FLG);
+		ASSERT(x->flags & IS_BF_FLG);
 		SET_LIST_ELEM(blk);
-		LIST_NEXT(blk) = LIST_NEXT(x);
-		LIST_PREV(blk) = x;
-		if (LIST_NEXT(x))
-		    LIST_PREV(LIST_NEXT(x)) = blk;
-		LIST_NEXT(x) = blk;
+		AOFF_LIST_NEXT(blk) = AOFF_LIST_NEXT(x);
+		AOFF_LIST_PREV(blk) = x;
+		if (AOFF_LIST_NEXT(x))
+		    AOFF_LIST_PREV(AOFF_LIST_NEXT(x)) = blk;
+		AOFF_LIST_NEXT(x) = blk;
 		return;
 	    }
 	}
@@ -853,7 +853,7 @@ rbt_insert(enum AOFFSortOrder order, AOFF_RBTree_t** root, AOFF_RBTree_t* blk)
     }
     if (order == FF_BF) {
 	SET_TREE_NODE(blk);
-	LIST_NEXT(blk) = NULL;
+	AOFF_LIST_NEXT(blk) = NULL;
     }
 }
 
@@ -900,7 +900,7 @@ aoff_get_free_block(Allctr_t *allctr, Uint size,
 #ifdef HARD_DEBUG
     AOFF_RBTree_t* dbg_blk;
 #endif
-    
+
     ASSERT(!cand_blk || cand_size >= size);
 
     /* Get first-fit carrier
@@ -993,7 +993,7 @@ static void aoff_add_mbc(Allctr_t *allctr, Carrier_t *carrier)
     AOFF_RBTree_t **root = &alc->mbc_root;
 
     ASSERT(!IS_CRR_IN_TREE(crr, *root));
-    HARD_CHECK_TREE(NULL, alc->crr_order, *root, 0);   
+    HARD_CHECK_TREE(NULL, alc->crr_order, *root, 0);
 
     rbt_insert(alc->crr_order, root, &crr->rbt_node);
 
@@ -1073,7 +1073,8 @@ static Block_t *aoff_first_fblk_in_mbc(Allctr_t *allctr, Carrier_t *carrier)
         AOFF_RBTree_t *blk;
 
         /* Descend to the rightmost block of the tree. */
-        for (blk = crr->root; blk->right; blk = blk->right);
+        for (blk = crr->root; blk->right; blk = blk->right)
+            ;
 
         return (Block_t*)blk;
     }
@@ -1093,7 +1094,8 @@ static Block_t *aoff_next_fblk_in_mbc(Allctr_t *allctr, Carrier_t *carrier,
 
     if (blk->left) {
         /* Descend to the rightmost block of the left subtree. */
-        for (blk = blk->left; blk->right; blk = blk->right);
+        for (blk = blk->left; blk->right; blk = blk->right)
+            ;
 
         return (Block_t*)blk;
     }
@@ -1190,7 +1192,7 @@ info_options(Allctr_t *allctr,
     }
 
     if (hpp || szp) {
-	
+
 	if (!atoms_initialized)
 	    erts_exit(ERTS_ERROR_EXIT, "%s:%d: Internal error: Atoms not initialized",
 		     __FILE__, __LINE__);;
@@ -1217,7 +1219,7 @@ erts_aoffalc_test(UWord op, UWord a1, UWord a2)
     switch (op) {
     case 0x500: return (UWord) ((AOFFAllctr_t *) a1)->blk_order == FF_AOBF;
     case 0x501: {
-	AOFF_RBTree_t *node = ((AOFFAllctr_t *) a1)->mbc_root; 
+	AOFF_RBTree_t *node = ((AOFFAllctr_t *) a1)->mbc_root;
 	Uint size = (Uint) a2;
 	node = node ? rbt_search(node, size) : NULL;
 	return (UWord) (node ? RBT_NODE_TO_MBC(node)->root : NULL);
@@ -1225,13 +1227,13 @@ erts_aoffalc_test(UWord op, UWord a1, UWord a2)
     case 0x502:	return (UWord) ((AOFF_RBTree_t *) a1)->parent;
     case 0x503:	return (UWord) ((AOFF_RBTree_t *) a1)->left;
     case 0x504:	return (UWord) ((AOFF_RBTree_t *) a1)->right;
-    case 0x505:	return (UWord) LIST_NEXT(a1);
+    case 0x505:	return (UWord) AOFF_LIST_NEXT(a1);
     case 0x506:	return (UWord) IS_BLACK((AOFF_RBTree_t *) a1);
     case 0x507:	return (UWord) IS_TREE_NODE((AOFF_RBTree_t *) a1);
     case 0x508: return (UWord) 0; /* IS_BF_ALGO */
     case 0x509: return (UWord) ((AOFF_RBTree_t *) a1)->max_sz;
     case 0x50a: return (UWord) ((AOFFAllctr_t *) a1)->blk_order == FF_BF;
-    case 0x50b:	return (UWord) LIST_PREV(a1);
+    case 0x50b:	return (UWord) AOFF_LIST_PREV(a1);
     default:	ASSERT(0); return ~((UWord) 0);
     }
 }
@@ -1251,7 +1253,7 @@ static int rbt_is_member(AOFF_RBTree_t* root, AOFF_RBTree_t* node)
             return 0;
         }
 	node = node->parent;
-    }    
+    }
     return 1;
 }
 
@@ -1364,15 +1366,15 @@ check_tree(Carrier_t* within_crr, enum AOFFSortOrder order, AOFF_RBTree_t* root,
 	}
 	if (order == FF_BF) {
 	    AOFF_RBTree_t* y = x;
-	    AOFF_RBTree_t* nxt = LIST_NEXT(y);
+	    AOFF_RBTree_t* nxt = AOFF_LIST_NEXT(y);
 	    ASSERT(IS_TREE_NODE(x));
 	    while (nxt) {
 		ASSERT(IS_LIST_ELEM(nxt));
 		ASSERT(AOFF_BLK_SZ(nxt) == AOFF_BLK_SZ(x));
 		ASSERT(FBLK_TO_MBC(&nxt->hdr) == within_crr);
-		ASSERT(LIST_PREV(nxt) == y);
+		ASSERT(AOFF_LIST_PREV(nxt) == y);
 		y = nxt;
-		nxt = LIST_NEXT(nxt);
+		nxt = AOFF_LIST_NEXT(nxt);
 	    }
 	}
 
@@ -1386,13 +1388,13 @@ check_tree(Carrier_t* within_crr, enum AOFFSortOrder order, AOFF_RBTree_t* root,
 	if (x->left) {
 	    ASSERT(x->left->parent == x);
 	    ASSERT(cmp_blocks(order, x->left, x) < 0);
-	    ASSERT(x->left->max_sz <= x->max_sz);	    
+	    ASSERT(x->left->max_sz <= x->max_sz);
 	}
 
 	if (x->right) {
 	    ASSERT(x->right->parent == x);
 	    ASSERT(cmp_blocks(order, x->right, x) > 0);
-	    ASSERT(x->right->max_sz <= x->max_sz);	    
+	    ASSERT(x->right->max_sz <= x->max_sz);
 	}
 	ASSERT(x->max_sz >= AOFF_BLK_SZ(x));
 	ASSERT(x->max_sz == AOFF_BLK_SZ(x)
@@ -1412,7 +1414,7 @@ check_tree(Carrier_t* within_crr, enum AOFFSortOrder order, AOFF_RBTree_t* root,
 	x = x->parent;
 	--depth;
     }
-    ASSERT(depth == 0 || (!root && depth==1)); 
+    ASSERT(depth == 0 || (!root && depth==1));
     ASSERT(curr_blacks == 0);
     ASSERT((1 << (max_depth/2)) <= node_cnt);
 
@@ -1458,4 +1460,3 @@ print_tree(AOFF_RBTree_t* root)
 #endif /* PRINT_TREE */
 
 #endif /* HARD_DEBUG */
-

@@ -1,7 +1,7 @@
 %%
 %% %CopyrightBegin%
 %% 
-%% Copyright Ericsson AB 2007-2018. All Rights Reserved.
+%% Copyright Ericsson AB 2007-2020. All Rights Reserved.
 %% 
 %% Licensed under the Apache License, Version 2.0 (the "License");
 %% you may not use this file except in compliance with the License.
@@ -28,7 +28,8 @@
 	 mixed_matching_clauses/1,unnecessary_building/1,
 	 no_no_file/1,configuration/1,supplies/1,
          redundant_stack_frame/1,export_from_case/1,
-         empty_values/1,cover_letrec_effect/1]).
+         empty_values/1,cover_letrec_effect/1,
+         receive_effect/1]).
 
 -export([foo/0,foo/1,foo/2,foo/3]).
 
@@ -48,7 +49,8 @@ groups() ->
        mixed_matching_clauses,unnecessary_building,
        no_no_file,configuration,supplies,
        redundant_stack_frame,export_from_case,
-       empty_values,cover_letrec_effect]}].
+       empty_values,cover_letrec_effect,
+       receive_effect]}].
 
 
 init_per_suite(Config) ->
@@ -110,6 +112,8 @@ setelement(Config) when is_list(Config) ->
     {a,b,[1,2,3]} = id(setelement(3, {a,b,c}, New)),
     {a,b,[1,2,3]} = id(setelement(3, {a,X,c}, New)),
 
+    {{d,c,b,a,x}, {z,c,b,a,x}} = setelement_cover(erlang:make_tuple(5, x)),
+
     {'EXIT',{badarg,_}} = (catch setelement_crash({a,b,c,d,e,f})),
     error = setelement_crash_2({a,b,c,d,e,f}, <<42>>),
 
@@ -117,6 +121,14 @@ setelement(Config) when is_list(Config) ->
     {'EXIT',{badarg,_}} = (catch setelement(3, {a,b}, New)),
 
     ok.
+
+setelement_cover(T0) ->
+    T1 = setelement(4, T0, a),
+    T2 = setelement(3, T1, b),
+    T3 = setelement(2, T2, c),
+    T4 = setelement(1, T3, d),
+    T5 = setelement(1, T3, z),
+    {T4,T5}.
 
 setelement_crash(Tuple) ->
     %% Used to crash the compiler because sys_core_dsetel did not notice that
@@ -307,6 +319,13 @@ coverage(Config) when is_list(Config) ->
 		{_,_} ->
 		    Tuple =:= true
 	    end,
+
+    %% Cover is literal_fun/1.
+    {'EXIT',{{case_clause,42},_}} = (catch cover_is_literal_fun()),
+
+    %% Cover core_lib.
+    ok = cover_core_lib([ok,nok]),
+
     ok.
 
 cover_will_match_list_type(A) ->
@@ -374,13 +393,28 @@ cover_eval_is_function(X) ->
 bsm_an_inlined(<<_:8>>, _) -> ok;
 bsm_an_inlined(_, _) -> error.
 
+cover_is_literal_fun() ->
+    [case id(42) of
+         [] ->
+             try right of
+                 wrong -> true
+             catch
+                 error:_ -> error
+             end
+     end]().
+
+cover_core_lib(Modules) ->
+    R = id(Modules),
+    _ = [id(Error) || Error <- R, element(1, Error) =/= ok],
+    ok.
+
 unused_multiple_values_error(Config) when is_list(Config) ->
     PrivDir = proplists:get_value(priv_dir, Config),
     Dir = test_lib:get_data_dir(Config),
     Core = filename:join(Dir, "unused_multiple_values_error"),
     Opts = [no_copt,clint,ssalint,return,from_core,{outdir,PrivDir}
 	   |test_lib:opt_opts(?MODULE)],
-    {error,[{unused_multiple_values_error,
+    {error,[{"unused_multiple_values_error",
 	     [{none,core_lint,{return_mismatch,{hello,1}}}]}],
      []} = c:c(Core, Opts),
     ok.
@@ -532,7 +566,7 @@ configuration(_Config) ->
     ok.
 
 configuration() ->
-    [forgotten || Components <- enemy, is_tuple(fun art/0)].
+    [forgotten || _Components <- enemy, is_tuple(fun art/0)].
 
 art() ->
  creating.
@@ -640,5 +674,13 @@ cover_letrec_effect(_Config) ->
             #{k := {{tag,42},<<42:16>>}} = Any
     end,
     ok.
+
+receive_effect(_Config) ->
+    self() ! whatever,
+    {} = do_receive_effect(),
+    ok.
+
+do_receive_effect() ->
+    {} = receive _ -> {} = {} end.
 
 id(I) -> I.

@@ -1,7 +1,7 @@
 %%
 %% %CopyrightBegin%
 %%
-%% Copyright Ericsson AB 2008-2017. All Rights Reserved.
+%% Copyright Ericsson AB 2008-2020. All Rights Reserved.
 %%
 %% Licensed under the Apache License, Version 2.0 (the "License");
 %% you may not use this file except in compliance with the License.
@@ -22,13 +22,30 @@
 
 -module(ssl_npn_hello_SUITE).
 
-%% Note: This directive should only be used in test suites.
--compile(export_all).
--include("ssl_cipher.hrl").
--include("ssl_internal.hrl").
--include("tls_handshake.hrl").
--include("tls_record.hrl").
+-behaviour(ct_suite).
+
+-include_lib("ssl/src/tls_record.hrl").
+-include_lib("ssl/src/tls_handshake.hrl").
+-include_lib("ssl/src/ssl_cipher.hrl").
+-include_lib("ssl/src/ssl_internal.hrl").
 -include_lib("common_test/include/ct.hrl").
+
+
+%% Callback functions
+-export([all/0,
+         init_per_suite/1,
+         end_per_suite/1,
+         init_per_testcase/2,
+         end_per_testcase/2]).
+
+%% Testcases
+-export([encode_and_decode_npn_client_hello_test/1,
+         encode_and_decode_npn_server_hello_test/1,
+         encode_and_decode_client_hello_test/1,
+         encode_and_decode_server_hello_test/1,
+         create_server_hello_with_advertised_protocols_test/1,
+         create_server_hello_with_no_advertised_protocols_test/1
+        ]).
 
 %%--------------------------------------------------------------------
 %% Common Test interface functions -----------------------------------
@@ -70,7 +87,8 @@ encode_and_decode_client_hello_test(Config) ->
     HandShakeData = create_client_handshake(undefined),
     Version = ssl_test_lib:protocol_version(Config),
     {[{DecodedHandshakeMessage, _Raw}], _} =
-	tls_handshake:get_tls_handshake(Version, list_to_binary(HandShakeData), <<>>, #ssl_options{}),
+	tls_handshake:get_tls_handshake(Version, list_to_binary(HandShakeData), <<>>,
+                                        default_options_map()),
     Extensions = DecodedHandshakeMessage#client_hello.extensions,
     #{next_protocol_negotiation := undefined} = Extensions.
 %%--------------------------------------------------------------------
@@ -78,7 +96,8 @@ encode_and_decode_npn_client_hello_test(Config) ->
     HandShakeData = create_client_handshake(#next_protocol_negotiation{extension_data = <<>>}),
     Version = ssl_test_lib:protocol_version(Config),
     {[{DecodedHandshakeMessage, _Raw}], _} =
-	tls_handshake:get_tls_handshake(Version, list_to_binary(HandShakeData), <<>>,  #ssl_options{}),
+	tls_handshake:get_tls_handshake(Version, list_to_binary(HandShakeData), <<>>,
+                                        default_options_map()),
     Extensions = DecodedHandshakeMessage#client_hello.extensions,
     #{next_protocol_negotiation := #next_protocol_negotiation{extension_data = <<>>}} = Extensions.
 %%--------------------------------------------------------------------
@@ -86,7 +105,8 @@ encode_and_decode_server_hello_test(Config) ->
     HandShakeData = create_server_handshake(undefined),
     Version = ssl_test_lib:protocol_version(Config),
     {[{DecodedHandshakeMessage, _Raw}], _} =
-	tls_handshake:get_tls_handshake(Version, list_to_binary(HandShakeData), <<>>, #ssl_options{}),
+	tls_handshake:get_tls_handshake(Version, list_to_binary(HandShakeData), <<>>,
+                                        default_options_map()),
     Extensions = DecodedHandshakeMessage#server_hello.extensions,
     #{next_protocol_negotiation := undefined} = Extensions.
 
@@ -95,7 +115,8 @@ encode_and_decode_npn_server_hello_test(Config) ->
     HandShakeData = create_server_handshake(#next_protocol_negotiation{extension_data = <<6, "spdy/2">>}),
     Version = ssl_test_lib:protocol_version(Config),
     {[{DecodedHandshakeMessage, _Raw}], _} =
-	tls_handshake:get_tls_handshake(Version, list_to_binary(HandShakeData), <<>>,  #ssl_options{}),
+	tls_handshake:get_tls_handshake(Version, list_to_binary(HandShakeData), <<>>,
+                                        default_options_map()),
     Extensions = DecodedHandshakeMessage#server_hello.extensions, 
     ct:log("~p ~n", [Extensions]),
     #{next_protocol_negotiation := #next_protocol_negotiation{extension_data = <<6, "spdy/2">>}} = Extensions.
@@ -148,3 +169,7 @@ create_connection_states() ->
       current_read => #{secure_renegotiation => false
                        }
      }.
+
+default_options_map() ->
+    Fun = fun (_Key, {Default, _}) -> Default end,
+    maps:map(Fun, ?RULES).

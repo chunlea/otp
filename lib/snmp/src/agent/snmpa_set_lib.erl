@@ -1,7 +1,7 @@
 %%
 %% %CopyrightBegin%
 %% 
-%% Copyright Ericsson AB 1996-2016. All Rights Reserved.
+%% Copyright Ericsson AB 1996-2020. All Rights Reserved.
 %% 
 %% Licensed under the Apache License, Version 2.0 (the "License");
 %% you may not use this file except in compliance with the License.
@@ -390,7 +390,7 @@ dbg_apply(M,F,A) ->
         {'EXIT', {function_clause, [{M, F, A} | _]}} ->
             {'EXIT', {hook_function_clause, {M, F, A}}};
 
-						% XYZ: Older format for compatibility
+        %% XYZ: Older format for compatibility
         {'EXIT', {undef, {M, F, A}}} ->
             {'EXIT', {hook_undef, {M, F, A}}};
         {'EXIT', {function_clause, {M, F, A}}} ->

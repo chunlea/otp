@@ -1,7 +1,7 @@
 % This is an -*- erlang -*- file.
 %% %CopyrightBegin%
 %%
-%% Copyright Ericsson AB 1997-2017. All Rights Reserved.
+%% Copyright Ericsson AB 1997-2020. All Rights Reserved.
 %%
 %% Licensed under the Apache License, Version 2.0 (the "License");
 %% you may not use this file except in compliance with the License.
@@ -19,16 +19,16 @@
 
 {application, compiler,
  [{description, "ERTS  CXC 138 10"},
-  {vsn, "7.2.7"},
+  {vsn, "7.6.7"},
   {modules, [
 	     beam_a,
 	     beam_asm,
 	     beam_block,
-	     beam_bs,
+             beam_call_types,
 	     beam_clean,
 	     beam_dict,
+	     beam_digraph,
 	     beam_disasm,
-	     beam_except,
 	     beam_flatten,
 	     beam_jump,
              beam_kernel_to_ssa,
@@ -36,6 +36,8 @@
 	     beam_opcodes,
 	     beam_peep,
              beam_ssa,
+             beam_ssa_bc_size,
+             beam_ssa_bool,
              beam_ssa_bsm,
              beam_ssa_codegen,
              beam_ssa_dead,
@@ -46,15 +48,16 @@
              beam_ssa_pre_codegen,
              beam_ssa_recv,
              beam_ssa_share,
+             beam_ssa_throw,
              beam_ssa_type,
 	     beam_trim,
+             beam_types,
 	     beam_utils,
 	     beam_validator,
 	     beam_z,
 	     cerl,
 	     cerl_clauses,
 	     cerl_inline,
-             cerl_sets,
 	     cerl_trees,
 	     compile,
 	     core_scan,
@@ -66,10 +69,11 @@
 	     rec_env,
 	     sys_core_alias,
 	     sys_core_bsm,
-	     sys_core_dsetel,
 	     sys_core_fold,
 	     sys_core_fold_lists,
 	     sys_core_inline,
+	     sys_core_prepare,
+	     sys_messages,
 	     sys_pre_attributes,
 	     v3_core,
 	     v3_kernel,
@@ -78,5 +82,5 @@
   {registered, []},
   {applications, [kernel, stdlib]},
   {env, []},
-  {runtime_dependencies, ["stdlib-2.5","kernel-4.0","hipe-3.12","erts-9.0",
+  {runtime_dependencies, ["stdlib-3.13","kernel-7.0","erts-11.0",
 			  "crypto-3.6"]}]}.

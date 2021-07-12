@@ -1,7 +1,7 @@
 %%
 %% %CopyrightBegin%
 %%
-%% Copyright Ericsson AB 2008-2018. All Rights Reserved.
+%% Copyright Ericsson AB 2008-2020. All Rights Reserved.
 %%
 %% Licensed under the Apache License, Version 2.0 (the "License");
 %% you may not use this file except in compliance with the License.
@@ -22,7 +22,7 @@
 
 -export([module/2]).
 
--import(lists, [reverse/1,member/2]).
+-import(lists, [reverse/1,member/2,usort/1]).
 
 -spec module(beam_utils:module_code(), [compile:option()]) ->
                     {'ok',beam_utils:module_code()}.
@@ -184,7 +184,8 @@ prune_redundant_values([], _) -> [].
 
 simplify_get_map_elements(Fail, Src, {list,[Key,Dst]},
                           [{get_map_elements,Fail,Src,{list,List1}}|Acc]) ->
-    case are_keys_literals([Key]) andalso are_keys_literals(List1) of
+    case are_keys_literals([Key]) andalso are_keys_literals(List1) andalso
+        not is_source_overwritten(Src, List1) of
         true ->
             case member(Key, List1) of
                 true ->
@@ -207,7 +208,7 @@ simplify_has_map_fields(Fail, [Src|Keys0],
                         [{test,has_map_fields,Fail,[Src|Keys1]}|Acc]) ->
     case are_keys_literals(Keys0) andalso are_keys_literals(Keys1) of
         true ->
-            Keys = Keys0 ++ Keys1,
+            Keys = usort(Keys0 ++ Keys1),
             {ok,[{test,has_map_fields,Fail,[Src|Keys]}|Acc]};
         false ->
             error
@@ -217,3 +218,6 @@ simplify_has_map_fields(_, _, _) -> error.
 are_keys_literals([{x,_}|_]) -> false;
 are_keys_literals([{y,_}|_]) -> false;
 are_keys_literals([_|_]) -> true.
+
+is_source_overwritten(Src, [_Key,Src]) -> true;
+is_source_overwritten(_, _) -> false.

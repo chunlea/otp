@@ -1,7 +1,7 @@
 /*
  * %CopyrightBegin%
  *
- * Copyright Ericsson AB 2010-2018. All Rights Reserved.
+ * Copyright Ericsson AB 2010-2020. All Rights Reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -23,7 +23,9 @@
 
 #include "common.h"
 
+#ifdef HAVE_DSA
 int get_dss_private_key(ErlNifEnv* env, ERL_NIF_TERM key, DSA *dsa);
 int get_dss_public_key(ErlNifEnv* env, ERL_NIF_TERM key, DSA *dsa);
+#endif
 
 #endif /* E_DSS_H__ */

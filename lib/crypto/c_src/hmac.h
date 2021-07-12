@@ -1,7 +1,7 @@
 /*
  * %CopyrightBegin%
  *
- * Copyright Ericsson AB 2010-2018. All Rights Reserved.
+ * Copyright Ericsson AB 2010-2020. All Rights Reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -21,13 +21,19 @@
 #ifndef E_HMAC_H__
 #define E_HMAC_H__ 1
 
+#if !defined(HAS_EVP_PKEY_CTX) || DISABLE_EVP_HMAC
+
 #include "common.h"
 
 int init_hmac_ctx(ErlNifEnv *env);
 
-ERL_NIF_TERM hmac_nif(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[]);
 ERL_NIF_TERM hmac_init_nif(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[]);
 ERL_NIF_TERM hmac_update_nif(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[]);
 ERL_NIF_TERM hmac_final_nif(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[]);
+
+int hmac_low_level(ErlNifEnv* env, const EVP_MD *md,
+                   ErlNifBinary key_bin, ErlNifBinary text,
+                   ErlNifBinary *ret_bin, int *ret_bin_alloc, ERL_NIF_TERM *return_term);
+#endif
 
 #endif /* E_HMAC_H__ */

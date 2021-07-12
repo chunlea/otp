@@ -326,6 +326,8 @@ parse_search_args([{base, Base}|T],A) ->
     parse_search_args(T,A#eldap_search{base = Base});
 parse_search_args([{filter, Filter}|T],A) ->
     parse_search_args(T,A#eldap_search{filter = Filter});
+parse_search_args([{size_limit, SizeLimit}|T],A) when is_integer(SizeLimit) ->
+    parse_search_args(T,A#eldap_search{size_limit = SizeLimit});
 parse_search_args([{scope, Scope}|T],A) ->
     parse_search_args(T,A#eldap_search{scope = Scope});
 parse_search_args([{deref, Deref}|T],A) ->
@@ -749,7 +751,7 @@ do_search_0(Data, A, Controls) ->
     Req = #'SearchRequest'{baseObject = A#eldap_search.base,
 			   scope = v_scope(A#eldap_search.scope),
 			   derefAliases = v_deref(A#eldap_search.deref),
-			   sizeLimit = 0, % no size limit
+			   sizeLimit = v_size_limit(A#eldap_search.size_limit),
 			   timeLimit = v_timeout(A#eldap_search.timeout),
 			   typesOnly = v_bool(A#eldap_search.types_only),
 			   filter = v_filter(A#eldap_search.filter),
@@ -777,6 +779,9 @@ collect_search_responses(Data, S, ID, {ok,Msg}, Acc, Ref)
                 success ->
                     log2(Data, "search reply = searchResDone ~n", []),
                     {ok,Acc,Ref,Data};
+                sizeLimitExceeded ->
+                     log2(Data, "[TRUNCATED] search reply = searchResDone ~n", []),
+                     {ok,Acc,Ref,Data};
 		referral -> 
 		    {{ok, {referral,R#'LDAPResult'.referral}}, Data};
                 Reason ->
@@ -957,20 +962,20 @@ do_modify_dn_0(Data, Entry, NewRDN, DelOldRDN, NewSup, Controls) ->
 do_unbind(Data) ->
     Req = "",
     log2(Data, "unbind request = ~p (has no reply)~n", [Req]),
-    case Data#eldap.using_tls of
-	true ->
-            send_request(Data#eldap.fd, Data, Data#eldap.id, {unbindRequest, Req}),
-            ssl:close(Data#eldap.fd);
-	false ->
-            OldTrapExit = process_flag(trap_exit, true),
-            catch send_request(Data#eldap.fd, Data, Data#eldap.id, {unbindRequest, Req}),
-            catch gen_tcp:close(Data#eldap.fd),
-            receive
-                {'EXIT', _From, _Reason} -> ok
-            after 0 -> ok
-            end,
-            process_flag(trap_exit, OldTrapExit)
-    end,
+    _ = case Data#eldap.using_tls of
+            true ->
+                send_request(Data#eldap.fd, Data, Data#eldap.id, {unbindRequest, Req}),
+                ssl:close(Data#eldap.fd);
+            false ->
+                OldTrapExit = process_flag(trap_exit, true),
+                catch send_request(Data#eldap.fd, Data, Data#eldap.id, {unbindRequest, Req}),
+                catch gen_tcp:close(Data#eldap.fd),
+                receive
+                    {'EXIT', _From, _Reason} -> ok
+                after 0 -> ok
+                end,
+                process_flag(trap_exit, OldTrapExit)
+        end,
     {no_reply, Data#eldap{binddn = (#eldap{})#eldap.binddn,
 			  passwd = (#eldap{})#eldap.passwd,
 			  fd     = (#eldap{})#eldap.fd,
@@ -1088,6 +1093,9 @@ v_bool(true)  -> true;
 v_bool(false) -> false;
 v_bool(_Bool) -> throw({error,concat(["not Boolean: ",_Bool])}).
 
+v_size_limit(I) when is_integer(I), I>=0 -> I;
+v_size_limit(_I) -> throw({error,concat(["size_limit not positive integer: ",_I])}).
+
 v_timeout(I) when is_integer(I), I>=0 -> I;
 v_timeout(_I) -> throw({error,concat(["timeout not positive integer: ",_I])}).
 
@@ -1130,7 +1138,7 @@ ldap_closed_p(Data, Emsg) when Data#eldap.using_tls == true ->
     %% Check if the SSL socket seems to be alive or not
     case catch ssl:sockname(Data#eldap.fd) of
 	{error, _} ->
-	    ssl:close(Data#eldap.fd),
+	    _ = ssl:close(Data#eldap.fd),
 	    {error, ldap_closed};
 	{ok, _} ->
 	    {error, Emsg};

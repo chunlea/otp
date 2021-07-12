@@ -1,15 +1,17 @@
 <?xml version="1.0" encoding="utf-8" ?>
 <!DOCTYPE erlref SYSTEM "erlref.dtd" [
-  <!ENTITY spawn_opt
-  '<seealso marker="erts:erlang#spawn_opt-2">erlang:spawn_opt/2</seealso>'>
+  <!ENTITY spawn_opt2
+  '<seemfa marker="erts:erlang#spawn_opt/2">erlang:spawn_opt/2</seemfa>'>
+  <!ENTITY spawn_opt5
+  '<seemfa marker="erts:erlang#spawn_opt/5">erlang:spawn_opt/5</seemfa>'>
   <!ENTITY nodes
-  '<seealso marker="erts:erlang#nodes-0">erlang:nodes/0</seealso>'>
+  '<seemfa marker="erts:erlang#nodes/0">erlang:nodes/0</seemfa>'>
   <!ENTITY make_ref
-  '<seealso marker="erts:erlang#make_ref-0">erlang:make_ref/0</seealso>'>
+  '<seemfa marker="erts:erlang#make_ref/0">erlang:make_ref/0</seemfa>'>
   <!ENTITY transport_module
-  '<seealso marker="diameter_transport">transport module</seealso>'>
+  '<seeerl marker="diameter_transport">transport module</seeerl>'>
   <!ENTITY dictionary
-  '<seealso marker="diameter_dict">dictionary</seealso>'>
+  '<seefile marker="diameter_dict">dictionary</seefile>'>
   <!ENTITY % also SYSTEM "seealso.ent" >
   <!ENTITY % here SYSTEM "seehere.ent" >
   %also;
@@ -21,7 +23,7 @@
 
 <copyright>
 <year>2011</year>
-<year>2017</year>
+<year>2020</year>
 <holder>Ericsson AB. All Rights Reserved.</holder>
 </copyright>
 <legalnotice>
@@ -1044,8 +1046,9 @@ each node from which requests are sent.</p>
 <tag><c>&transport_opt;</c></tag>
 <item>
 <p>
-Any transport option except <c>applications</c> or
-<c>capabilities</c>.
+Any transport option except <c>applications</c>,
+<c>capabilities</c>, <c>transport_config</c>, and
+<c>transport_module</c>.
 Used as defaults for transport configuration, values passed to
 &add_transport; overriding values configured on the service.</p>
 </item>
@@ -1384,12 +1387,23 @@ the same peer.</p>
 </item>
 
 <tag>
-<marker id="spawn_opt"/><c>{spawn_opt, [term()]}</c></tag>
+<marker id="spawn_opt"/><c>{spawn_opt, [term()] | {M,F,A}}</c></tag>
 <item>
 <p>
-Options passed to &spawn_opt; when spawning a process for an
-incoming Diameter request.
-Options <c>monitor</c> and <c>link</c> are ignored.</p>
+An options list passed to &spawn_opt2; to spawn a handler process for an
+incoming Diameter request on the local node, or an MFA that returns
+the pid of a handler process.</p>
+
+<p>
+Options <c>monitor</c> and <c>link</c> are ignored in the list-valued
+case.
+An MFA is applied with an additional term prepended to its argument
+list, and should return either the pid of the handler process that
+invokes <c>diameter_traffic:request/1</c> on the argument in order to
+process the request, or the atom <c>discard</c>.
+The handler process need not be local, and diameter need not be
+started on the remote node, but diameter and relevant application
+callbacks must be on the code path.</p>
 
 <p>
 Defaults to the empty list.</p>

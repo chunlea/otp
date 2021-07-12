@@ -1,7 +1,7 @@
 %%
 %% %CopyrightBegin%
 %%
-%% Copyright Ericsson AB 2018. All Rights Reserved.
+%% Copyright Ericsson AB 2018-2020. All Rights Reserved.
 %%
 %% Licensed under the Apache License, Version 2.0 (the "License");
 %% you may not use this file except in compliance with the License.
@@ -57,9 +57,10 @@
 -export([module/2, format_error/1]).
 
 -include("beam_ssa.hrl").
+-include("beam_types.hrl").
 
--import(lists, [member/2, reverse/1, splitwith/2, map/2, foldl/3, mapfoldl/3,
-                nth/2, max/1, unzip/1]).
+-import(lists, [member/2, reverse/1, reverse/2, splitwith/2, foldl/3,
+                mapfoldl/3, nth/2, max/1, unzip/1]).
 
 -spec format_error(term()) -> nonempty_string().
 
@@ -169,12 +170,14 @@ ccc_1([#b_local{}=Call | Args], Ctx, Aliases, ModInfo) ->
             Parameters = funcinfo_get(Callee, parameters, ModInfo),
             Parameter = nth(1 + arg_index(Ctx, Args), Parameters),
 
-            case maps:find(Parameter, ParamInfo) of
-                {ok, suitable_for_reuse} ->
+            case ParamInfo of
+                #{ Parameter := suitable_for_reuse } ->
                     suitable_for_reuse;
-                {ok, Other} ->
-                    {unsuitable_call, {Call, Other}};
-                error ->
+                #{ Parameter := {unsuitable_call, {Call, _}}=Info } ->
+                    Info;
+                #{ Parameter := Info } ->
+                    {unsuitable_call, {Call, Info}};
+                #{} ->
                     {no_match_on_entry, Call}
             end;
         UseCount > 1 ->
@@ -300,10 +303,12 @@ get_fa(#b_function{ anno = Anno }) ->
                promotions = #{} :: promotion_map() }).
 
 alias_matched_binaries(Blocks0, Counter, AliasMap) when AliasMap =/= #{} ->
-    State0 = #amb{ dominators = beam_ssa:dominators(Blocks0),
+    RPO = beam_ssa:rpo(Blocks0),
+    {Dominators, _} = beam_ssa:dominators(RPO, Blocks0),
+    State0 = #amb{ dominators = Dominators,
                    match_aliases = AliasMap,
                    cnt = Counter },
-    {Blocks, State} = beam_ssa:mapfold_blocks_rpo(fun amb_1/3, [0], State0,
+    {Blocks, State} = beam_ssa:mapfold_blocks(fun amb_1/3, RPO, State0,
                                                   Blocks0),
     {amb_insert_promotions(Blocks, State), State#amb.cnt};
 alias_matched_binaries(Blocks, Counter, _AliasMap) ->
@@ -313,7 +318,8 @@ amb_1(Lbl, #b_blk{is=Is0,last=Last0}=Block, State0) ->
     {Is, State1} = mapfoldl(fun(I, State) ->
                                     amb_assign_set(I, Lbl, State)
                             end, State0, Is0),
-    {Last, State} = amb_assign_last(Last0, Lbl, State1),
+    {Last1, State} = amb_assign_last(Last0, Lbl, State1),
+    Last = beam_ssa:normalize(Last1),
     {Block#b_blk{is=Is,last=Last}, State}.
 
 amb_assign_set(#b_set{op=phi,args=Args0}=I, _Lbl, State0) ->
@@ -347,7 +353,7 @@ amb_get_alias(#b_var{}=Arg, Lbl, State) ->
             %% Our context may not have been created yet, so we skip assigning
             %% an alias unless the given block is among our dominators.
             Dominators = maps:get(Lbl, State#amb.dominators),
-            case ordsets:is_element(AliasAfter, Dominators) of
+            case member(AliasAfter, Dominators) of
                 true -> amb_create_alias(Arg, Context, Lbl, State);
                 false -> {Arg, State}
             end;
@@ -438,37 +444,43 @@ is_var_in_args(_Var, []) -> false.
               renames = #{} :: beam_ssa:rename_map() }).
 
 combine_matches({Fs0, ModInfo}) ->
-    Fs = map(fun(F) -> combine_matches(F, ModInfo) end, Fs0),
+    Fs = [combine_matches(F, ModInfo) || F <- Fs0],
     {Fs, ModInfo}.
 
 combine_matches(#b_function{bs=Blocks0,cnt=Counter0}=F, ModInfo) ->
     case funcinfo_get(F, has_bsm_ops, ModInfo) of
         true ->
+            RPO = beam_ssa:rpo(Blocks0),
+            {Dominators, _} = beam_ssa:dominators(RPO, Blocks0),
             {Blocks1, State} =
-                beam_ssa:mapfold_blocks_rpo(
+                beam_ssa:mapfold_blocks(
                   fun(Lbl, #b_blk{is=Is0}=Block0, State0) ->
                           {Is, State} = cm_1(Is0, [], Lbl, State0),
                           {Block0#b_blk{is=Is}, State}
-                  end, [0],
-                  #cm{ definitions = beam_ssa:definitions(Blocks0),
-                       dominators = beam_ssa:dominators(Blocks0),
+                  end,
+                  RPO,
+                  #cm{ definitions = beam_ssa:definitions(RPO, Blocks0),
+                       dominators = Dominators,
                        blocks = Blocks0 },
                   Blocks0),
 
-            Blocks2 = beam_ssa:rename_vars(State#cm.renames, [0], Blocks1),
+            %% The fun in mapfold_blocks does not update terminators,
+            %% so we can reuse the RPO computed for Blocks0.
+            Blocks2 = beam_ssa:rename_vars(State#cm.renames, RPO, Blocks1),
 
             {Blocks, Counter} = alias_matched_binaries(Blocks2, Counter0,
                                                        State#cm.match_aliases),
 
-            F#b_function{ bs=Blocks, cnt=Counter };
+            F#b_function{ bs=beam_ssa:trim_unreachable(Blocks),
+                          cnt=Counter };
         false ->
             F
     end.
 
 cm_1([#b_set{ op=bs_start_match,
               dst=Ctx,
-              args=[Src] },
-      #b_set{ op=succeeded,
+              args=[_,Src] },
+      #b_set{ op={succeeded,guard},
               dst=Bool,
               args=[Ctx] }]=MatchSeq, Acc0, Lbl, State0) ->
     Acc = reverse(Acc0),
@@ -491,7 +503,7 @@ cm_handle_priors(Src, DstCtx, Bool, Acc, MatchSeq, Lbl, State0) ->
                         %% dominate us.
                         Dominators = maps:get(Lbl, State0#cm.dominators, []),
                         [Ctx || {ValidAfter, Ctx} <- Priors,
-                                ordsets:is_element(ValidAfter, Dominators)];
+                                member(ValidAfter, Dominators)];
                     error ->
                         []
                 end,
@@ -518,19 +530,28 @@ cm_register_prior(Src, DstCtx, Lbl, State) ->
     State#cm{ prior_matches = PriorMatches }.
 
 cm_combine_tail(Src, DstCtx, Bool, Acc, State0) ->
-    SrcCtx = match_context_of(Src, State0#cm.definitions),
+    SrcCtx0 = match_context_of(Src, State0#cm.definitions),
+
+    {SrcCtx, Renames} = cm_combine_tail_1(Bool, DstCtx, SrcCtx0,
+                                          State0#cm.renames),
 
     %% We replace the source with a context alias as it normally won't be used
     %% on the happy path after being matched, and the added cost of conversion
     %% is negligible if it is.
     Aliases = maps:put(Src, {0, SrcCtx}, State0#cm.match_aliases),
-
-    Renames0 = State0#cm.renames,
-    Renames = Renames0#{ Bool => #b_literal{val=true}, DstCtx => SrcCtx },
-
     State = State0#cm{ match_aliases = Aliases, renames = Renames },
 
     {Acc, State}.
+
+cm_combine_tail_1(Bool, DstCtx, SrcCtx, Renames0) ->
+    case Renames0 of
+        #{ SrcCtx := New } ->
+            cm_combine_tail_1(Bool, DstCtx, New, Renames0);
+        #{} ->
+            Renames = Renames0#{ Bool => #b_literal{val=true},
+                                 DstCtx => SrcCtx },
+            {SrcCtx, Renames}
+    end.
 
 %% Lets functions accept match contexts as arguments. The parameter must be
 %% unused before the bs_start_match instruction, and it must be matched in the
@@ -572,17 +593,22 @@ aca_1(Blocks, State) ->
     EntryBlock = maps:get(0, Blocks),
     aca_enable_reuse(EntryBlock#b_blk.is, EntryBlock, Blocks, [], State).
 
-aca_enable_reuse([#b_set{op=bs_start_match,args=[Src]}=I0 | Rest],
+aca_enable_reuse([#b_set{op=bs_start_match,args=[_,Src]}=I0 | Rest],
                  EntryBlock, Blocks0, Acc, State0) ->
     case aca_is_reuse_safe(Src, State0) of
         true ->
-            {I, Last, Blocks1, State} =
+            {I, Last0, Blocks1, State} =
                 aca_reuse_context(I0, EntryBlock, Blocks0, State0),
 
-            Is = reverse([I|Acc]) ++ Rest,
+            Is = reverse([I | Acc], Rest),
+            Last = beam_ssa:normalize(Last0),
             Blocks = maps:put(0, EntryBlock#b_blk{is=Is,last=Last}, Blocks1),
 
-            {Blocks, State};
+            %% Copying (and thus renaming) the successors of a block may cause
+            %% them to become unreachable under their original label, breaking
+            %% the phi nodes on the original path that refer to them, so we
+            %% remove unreachable blocks to make sure they aren't referenced.
+            {beam_ssa:trim_unreachable(Blocks), State};
         false ->
             {Blocks0, State0}
     end;
@@ -612,7 +638,8 @@ aca_is_reuse_safe(Src, State) ->
     %% they're unused so far.
     ordsets:is_element(Src, State#aca.unused_parameters).
 
-aca_reuse_context(#b_set{dst=Dst, args=[Src]}=I0, Block, Blocks0, State0) ->
+aca_reuse_context(#b_set{op=bs_start_match,dst=Dst,args=[_,Src]}=I0,
+                  Block, Blocks0, State0) ->
     %% When matching fails on a reused context it needs to be converted back
     %% to a binary. We only need to do this on the success path since it can't
     %% be a context on the type failure path, but it's very common for these
@@ -647,19 +674,22 @@ aca_handle_convergence(Src, State0, Last0, Blocks0) ->
                        ordsets:from_list(SuccPath),
                        ordsets:from_list(FailPath)),
 
-    case maps:is_key(Src, beam_ssa:uses(ConvergedPaths, Blocks0)) of
+    ConvergedLabels = beam_ssa:rpo(ConvergedPaths, Blocks0),
+    case maps:is_key(Src, beam_ssa:uses(ConvergedLabels, Blocks0)) of
         true ->
             case shortest(SuccPath, FailPath) of
                 left ->
                     {Succ, Blocks, Counter} =
                         aca_copy_successors(Succ0, Blocks0, State0#aca.counter),
                     State = State0#aca{ counter = Counter },
-                    {State, Last0#b_br{succ=Succ}, Blocks};
+                    Last = beam_ssa:normalize(Last0#b_br{succ=Succ}),
+                    {State, Last, Blocks};
                 right ->
                     {Fail, Blocks, Counter} =
                         aca_copy_successors(Fail0, Blocks0, State0#aca.counter),
                     State = State0#aca{ counter = Counter },
-                    {State, Last0#b_br{fail=Fail}, Blocks}
+                    Last = beam_ssa:normalize(Last0#b_br{fail=Fail}),
+                    {State, Last, Blocks}
             end;
         false ->
             {State0, Last0, Blocks0}
@@ -681,8 +711,12 @@ aca_copy_successors(Lbl0, Blocks0, Counter0) ->
     Lbl = maps:get(Lbl0, BRs),
     {Lbl, Blocks, Counter}.
 
+aca_cs_build_brs([?EXCEPTION_BLOCK=Lbl | Path], Counter, Acc) ->
+    %% ?EXCEPTION_BLOCK is a marker and not an actual block, so renaming it
+    %% will break exception handling.
+    aca_cs_build_brs(Path, Counter, Acc#{ Lbl => Lbl });
 aca_cs_build_brs([Lbl | Path], Counter0, Acc) ->
-    aca_cs_build_brs(Path, Counter0 + 1, maps:put(Lbl, Counter0, Acc));
+    aca_cs_build_brs(Path, Counter0 + 1, Acc#{ Lbl => Counter0 });
 aca_cs_build_brs([], Counter, Acc) ->
     {Acc, Counter}.
 
@@ -697,7 +731,8 @@ aca_cs_1([], Blocks, Counter, _VRs, _BRs, Acc) ->
 
 aca_cs_block(#b_blk{is=Is0,last=Last0}=Block0, Counter0, VRs0, BRs) ->
     {VRs, Is, Counter} = aca_cs_is(Is0, Counter0, VRs0, BRs, []),
-    Last = aca_cs_last(Last0, VRs, BRs),
+    Last1 = aca_cs_last(Last0, VRs, BRs),
+    Last = beam_ssa:normalize(Last1),
     Block = Block0#b_blk{is=Is,last=Last},
     {VRs, Block, Counter}.
 
@@ -763,9 +798,8 @@ aca_cs_arg(Arg, VRs) ->
 %% contexts to us.
 
 allow_context_passthrough({Fs, ModInfo0}) ->
-    ModInfo =
-        acp_forward_params([{F, beam_ssa:uses(F#b_function.bs)} || F <- Fs],
-                           ModInfo0),
+    FsUses = [{F, beam_ssa:uses(beam_ssa:rpo(Bs), Bs)} || #b_function{bs=Bs}=F <- Fs],
+    ModInfo = acp_forward_params(FsUses, ModInfo0),
     {Fs, ModInfo}.
 
 acp_forward_params(FsUses, ModInfo0) ->
@@ -814,17 +848,18 @@ acp_1(_Param, _Uses, _ModInfo, ParamInfo) ->
                 match_aliases = #{} :: match_alias_map() }).
 
 skip_outgoing_tail_extraction({Fs0, ModInfo}) ->
-    Fs = map(fun(F) -> skip_outgoing_tail_extraction(F, ModInfo) end, Fs0),
+    Fs = [skip_outgoing_tail_extraction(F, ModInfo) || F <- Fs0],
     {Fs, ModInfo}.
 
 skip_outgoing_tail_extraction(#b_function{bs=Blocks0}=F, ModInfo) ->
     case funcinfo_get(F, has_bsm_ops, ModInfo) of
         true ->
-            State0 = #sote{ definitions = beam_ssa:definitions(Blocks0),
+            RPO = beam_ssa:rpo(Blocks0),
+            State0 = #sote{ definitions = beam_ssa:definitions(RPO, Blocks0),
                             mod_info = ModInfo },
 
-            {Blocks1, State} = beam_ssa:mapfold_instrs_rpo(
-                                 fun sote_rewrite_calls/2, [0], State0, Blocks0),
+            {Blocks1, State} = beam_ssa:mapfold_instrs(
+                                 fun sote_rewrite_calls/2, RPO, State0, Blocks0),
 
             {Blocks, Counter} = alias_matched_binaries(Blocks1,
                                                        F#b_function.cnt,
@@ -864,25 +899,25 @@ sote_rewrite_call(Call0, [Arg | ArgsIn], ArgsOut, State0) ->
             sote_rewrite_call(Call0, ArgsIn, [Arg | ArgsOut], State0)
     end.
 
-%% Adds parameter_type_info annotations to help the validator determine whether
-%% our optimizations were safe.
+%% Adds parameter annotations to help the validator determine whether our
+%% optimizations were safe.
 
 annotate_context_parameters({Fs, ModInfo}) ->
     mapfoldl(fun annotate_context_parameters/2, ModInfo, Fs).
 
 annotate_context_parameters(F, ModInfo) ->
     ParamInfo = funcinfo_get(F, parameter_info, ModInfo),
-    TypeAnno0 = beam_ssa:get_anno(parameter_type_info, F, #{}),
-    TypeAnno = maps:fold(fun(K, _V, Acc) when is_map_key(K, Acc) ->
-                                 %% Assertion.
-                                 error(conflicting_parameter_types);
-                            (K, suitable_for_reuse, Acc) ->
-                                 T = beam_validator:type_anno(match_context),
-                                 Acc#{ K => T };
-                            (_K, _V, Acc) ->
-                                 Acc
-                         end, TypeAnno0, ParamInfo),
-    {beam_ssa:add_anno(parameter_type_info, TypeAnno, F), ModInfo}.
+    ParamAnno0 = beam_ssa:get_anno(parameter_info, F, #{}),
+    ParamAnno = maps:fold(fun(K, _V, Acc) when is_map_key(K, Acc) ->
+                                  %% Assertion.
+                                  error(conflicting_parameter_types);
+                             (K, suitable_for_reuse, Acc) ->
+                                  Info = maps:get(K, Acc, []),
+                                  Acc#{ K => [accepts_match_context | Info] };
+                             (_K, _V, Acc) ->
+                                  Acc
+                          end, ParamAnno0, ParamInfo),
+    {beam_ssa:add_anno(parameter_info, ParamAnno, F), ModInfo}.
 
 %%%
 %%% +bin_opt_info
@@ -890,12 +925,13 @@ annotate_context_parameters(F, ModInfo) ->
 
 collect_opt_info(Fs) ->
     foldl(fun(#b_function{bs=Blocks}=F, Acc0) ->
-                  UseMap = beam_ssa:uses(Blocks),
+                  RPO = beam_ssa:rpo(Blocks),
+                  UseMap = beam_ssa:uses(RPO, Blocks),
                   Where = beam_ssa:get_anno(location, F, []),
-                  beam_ssa:fold_instrs_rpo(
+                  beam_ssa:fold_instrs(
                     fun(I, Acc) ->
                             collect_opt_info_1(I, Where, UseMap, Acc)
-                    end, [0], Acc0, Blocks)
+                    end, RPO, Acc0, Blocks)
           end, [], Fs).
 
 collect_opt_info_1(#b_set{op=Op,anno=Anno,dst=Dst}=I, Where, UseMap, Acc0) ->

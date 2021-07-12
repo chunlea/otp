@@ -1,7 +1,7 @@
 /*
  * %CopyrightBegin%
  *
- * Copyright Ericsson AB 2010-2018. All Rights Reserved.
+ * Copyright Ericsson AB 2010-2020. All Rights Reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -25,10 +25,10 @@
 #include <openssl/opensslconf.h>
 
 #include <openssl/crypto.h>
-#ifndef OPENSSL_NO_DES
 #include <openssl/des.h>
-#endif /* #ifndef OPENSSL_NO_DES */
+
 /* #include <openssl/idea.h> This is not supported on the openssl OTP requires */
+#include <openssl/dh.h>
 #include <openssl/dsa.h>
 #include <openssl/rsa.h>
 #include <openssl/aes.h>
@@ -89,6 +89,11 @@
 #  undef FIPS_SUPPORT
 # endif
 
+/* LibreSSL has never supported the custom mem functions */
+#ifndef HAS_LIBRESSL
+#  define HAS_CRYPTO_MEM_FUNCTIONS
+#endif
+
 # if LIBRESSL_VERSION_NUMBER < PACKED_OPENSSL_VERSION_PLAIN(2,7,0)
 /* LibreSSL wants the 1.0.1 API */
 # define NEED_EVP_COMPATIBILITY_FUNCTIONS
@@ -96,17 +101,40 @@
 #endif
 
 
+
 #if OPENSSL_VERSION_NUMBER < PACKED_OPENSSL_VERSION_PLAIN(1,1,0)
 # define NEED_EVP_COMPATIBILITY_FUNCTIONS
 #endif
 
+#ifndef HAS_LIBRESSL
+# if OPENSSL_VERSION_NUMBER >= PACKED_OPENSSL_VERSION_PLAIN(1,1,0)
+#  define HAS_BN_bn2binpad
+# endif
+#endif
 
 #ifndef HAS_LIBRESSL
 # if OPENSSL_VERSION_NUMBER >= PACKED_OPENSSL_VERSION_PLAIN(1,0,0)
 #  define HAS_EVP_PKEY_CTX
+#  define HAVE_EVP_CIPHER_CTX_COPY
+# endif
+
+# if OPENSSL_VERSION_NUMBER >= PACKED_OPENSSL_VERSION_PLAIN(1,1,1)
+#   define HAVE_PKEY_new_raw_private_key
+#   define HAVE_EVP_PKEY_new_CMAC_key
+#   define HAVE_DigestSign_as_single_op
 # endif
 #endif
 
+#if defined(HAS_EVP_PKEY_CTX) \
+    && OPENSSL_VERSION_NUMBER < PACKED_OPENSSL_VERSION_PLAIN(1,1,0)
+     /* EVP is slow on antique crypto libs.
+      * DISABLE_EVP_* is 0 or 1 from the configure script
+      */
+# undef  DISABLE_EVP_DH
+# define DISABLE_EVP_DH 1
+# undef  DISABLE_EVP_HMAC
+# define DISABLE_EVP_HMAC 1
+#endif
 
 #if OPENSSL_VERSION_NUMBER >= PACKED_OPENSSL_VERSION_PLAIN(1,0,0)
 #include <openssl/modes.h>
@@ -153,6 +181,51 @@
 #  define HAVE_SHA3_512
 # endif
 
+// BLAKE2:
+#if OPENSSL_VERSION_NUMBER >= PACKED_OPENSSL_VERSION_PLAIN(1,1,1) \
+    && !defined(HAS_LIBRESSL) \
+    && !defined(OPENSSL_NO_BLAKE2)
+# define HAVE_BLAKE2
+#endif
+
+#ifndef OPENSSL_NO_BF
+# define HAVE_BF
+#endif
+
+#ifndef OPENSSL_NO_DES
+# define HAVE_DES
+#endif
+
+#ifndef OPENSSL_NO_DH
+# define HAVE_DH
+#endif
+
+#ifndef OPENSSL_NO_DSA
+# define HAVE_DSA
+#endif
+
+#ifndef OPENSSL_NO_MD4
+# define HAVE_MD4
+#endif
+
+#ifndef OPENSSL_NO_MD5
+# define HAVE_MD5
+#endif
+
+#ifndef OPENSSL_NO_RC2
+# define HAVE_RC2
+#endif
+
+#ifndef OPENSSL_NO_RC4
+# define HAVE_RC4
+#endif
+
+#ifndef OPENSSL_NO_RMD160
+/* Note RMD160 vs RIPEMD160 */
+# define HAVE_RIPEMD160
+#endif
+
+
 #if OPENSSL_VERSION_NUMBER >= PACKED_OPENSSL_VERSION(0,9,8,'o') \
 	&& !defined(OPENSSL_NO_EC) \
 	&& !defined(OPENSSL_NO_ECDH) \
@@ -164,14 +237,12 @@
 #if OPENSSL_VERSION_NUMBER >= (PACKED_OPENSSL_VERSION_PLAIN(1,1,1) -7) \
     && !defined(HAS_LIBRESSL) \
     && defined(HAVE_EC)
-# define HAVE_ED_CURVE_DH
+# ifdef HAVE_DH
+#   define HAVE_EDDH
+# endif
 # if OPENSSL_VERSION_NUMBER >= (PACKED_OPENSSL_VERSION_PLAIN(1,1,1))
 #   define HAVE_EDDSA
 # endif
-#endif
-
-#if OPENSSL_VERSION_NUMBER >= PACKED_OPENSSL_VERSION(0,9,8,'c')
-# define HAVE_AES_IGE
 #endif
 
 #if OPENSSL_VERSION_NUMBER >= PACKED_OPENSSL_VERSION_PLAIN(1,0,1)
@@ -179,7 +250,9 @@
 # define HAVE_AEAD
 # define HAVE_GCM
 # define HAVE_CCM
-# define HAVE_CMAC
+# ifndef OPENSSL_NO_CMAC
+#   define HAVE_CMAC
+# endif
 # if defined(RSA_PKCS1_OAEP_PADDING)
 #   define HAVE_RSA_OAEP_PADDING
 # endif
@@ -191,21 +264,33 @@
 
 #if OPENSSL_VERSION_NUMBER >= PACKED_OPENSSL_VERSION_PLAIN(1,1,0)
 # ifndef HAS_LIBRESSL
-#  define HAVE_CHACHA20
-#  define HAVE_CHACHA20_POLY1305
+#  if !defined(OPENSSL_NO_CHACHA) && !defined(OPENSSL_NO_POLY1305)
+#    define HAVE_CHACHA20_POLY1305
+#  endif
 #  define HAVE_RSA_OAEP_MD
+# endif
+#endif
+
+#if OPENSSL_VERSION_NUMBER >= PACKED_OPENSSL_VERSION(1,1,0,'d')
+# ifndef HAS_LIBRESSL
+#  ifndef OPENSSL_NO_CHACHA
+#    define HAVE_CHACHA20
+#  endif
 # endif
 #endif
 
 // OPENSSL_VERSION_NUMBER >= 1.1.1-pre8
 #if OPENSSL_VERSION_NUMBER >= (PACKED_OPENSSL_VERSION_PLAIN(1,1,1)-7)
 # ifndef HAS_LIBRESSL
-#  define HAVE_POLY1305
+#  if !defined(OPENSSL_NO_POLY1305)
+#    define HAVE_POLY1305
+#  endif
 # endif
 #endif
 
 #if OPENSSL_VERSION_NUMBER <= PACKED_OPENSSL_VERSION(0,9,8,'l')
 # define HAVE_ECB_IVEC_BUG
+# define HAVE_UPDATE_EMPTY_DATA_BUG
 #endif
 
 #ifndef HAS_LIBRESSL
@@ -225,7 +310,9 @@
 /* If OPENSSL_NO_EC is set, there will be an error in ec.h included from engine.h
    So if EC is disabled, you can't use Engine either....
 */
+#if !defined(OPENSSL_NO_ENGINE)
 # define HAS_ENGINE_SUPPORT
+#endif
 #endif
 
 
@@ -291,11 +378,11 @@
                       (((unsigned char*) (s))[2] << 8)  | \
                       (((unsigned char*) (s))[3]))
 
-#define put_int32(s,i) \
-{ (s)[0] = (char)(((i) >> 24) & 0xff);\
-  (s)[1] = (char)(((i) >> 16) & 0xff);\
-  (s)[2] = (char)(((i) >> 8) & 0xff);\
-  (s)[3] = (char)((i) & 0xff);\
+#define put_uint32(s,i) \
+{ (s)[0] = (unsigned char)(((i) >> 24) & 0xff);\
+  (s)[1] = (unsigned char)(((i) >> 16) & 0xff);\
+  (s)[2] = (unsigned char)(((i) >> 8) & 0xff);\
+  (s)[3] = (unsigned char)((i) & 0xff);\
 }
 
 /* This shall correspond to the similar macro in crypto.erl */
@@ -303,11 +390,16 @@
 #define MAX_BYTES_TO_NIF 20000
 
 #define CONSUME_REDS(NifEnv, Ibin)			\
-do {							\
-    int _cost = ((Ibin).size  * 100) / MAX_BYTES_TO_NIF;\
+do {                                                    \
+    size_t _cost = (Ibin).size;                         \
+    if (_cost > SIZE_MAX / 100)                         \
+        _cost = 100;                                    \
+    else                                                \
+        _cost = (_cost * 100) / MAX_BYTES_TO_NIF;       \
+                                                        \
     if (_cost) {                                        \
         (void) enif_consume_timeslice((NifEnv),		\
-	          (_cost > 100) ? 100 : _cost);		\
+                (_cost > 100) ? 100 : (int)_cost);      \
     }                                                   \
  } while (0)
 
@@ -317,15 +409,24 @@ do {							\
 #  define HAVE_OPAQUE_BN_GENCB
 #endif
 
-/*
-#define PRINTF_ERR0(FMT) enif_fprintf(stderr, FMT "\n")
-#define PRINTF_ERR1(FMT, A1) enif_fprintf(stderr, FMT "\n", A1)
-#define PRINTF_ERR2(FMT, A1, A2) enif_fprintf(stderr, FMT "\n", A1, A2)
-*/
+#if 0
+#  define PRINTF_ERR0(FMT)         enif_fprintf(stderr, FMT "\n")
+#  define PRINTF_ERR1(FMT, A1)     enif_fprintf(stderr, FMT "\n", A1)
+#  define PRINTF_ERR2(FMT, A1, A2) enif_fprintf(stderr, FMT "\n", A1, A2)
+#else
+#  define PRINTF_ERR0(FMT)
+#  define PRINTF_ERR1(FMT,A1)
+#  define PRINTF_ERR2(FMT,A1,A2)
+#endif
 
-#define PRINTF_ERR0(FMT)
-#define PRINTF_ERR1(FMT,A1)
-#define PRINTF_ERR2(FMT,A1,A2)
+#if defined(FIPS_SUPPORT) \
+    && OPENSSL_VERSION_NUMBER  < PACKED_OPENSSL_VERSION_PLAIN(1,0,1)
+/* FIPS is not supported for versions < 1.0.1.  If FIPS_SUPPORT is enabled
+   there are some warnings/errors for thoose
+*/
+# undef FIPS_SUPPORT
+#endif
+
 
 #ifdef FIPS_SUPPORT
 /* In FIPS mode non-FIPS algorithms are disabled and return badarg. */

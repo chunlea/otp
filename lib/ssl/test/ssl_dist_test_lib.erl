@@ -1,7 +1,7 @@
 %%
 %% %CopyrightBegin%
 %%
-%% Copyright Ericsson AB 2017. All Rights Reserved.
+%% Copyright Ericsson AB 2017-2020. All Rights Reserved.
 %%
 %% Licensed under the Apache License, Version 2.0 (the "License");
 %% you may not use this file except in compliance with the License.
@@ -19,6 +19,8 @@
 %%
 
 -module(ssl_dist_test_lib).
+
+-behaviour(ct_suite).
 
 -include_lib("common_test/include/ct.hrl").
 -include_lib("public_key/include/public_key.hrl").
@@ -102,7 +104,7 @@ start_ssl_node(Name, Args) ->
     case open_port({spawn, CmdLine}, []) of
 	Port when is_port(Port) ->
 	    unlink(Port),
-	    erlang:port_close(Port),
+	    catch erlang:port_close(Port),
 	    case await_ssl_node_up(Name, LSock) of
 		#node_handle{} = NodeHandle ->
 		    ?t:format("Ssl node ~s started.~n", [Name]),

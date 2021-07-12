@@ -1,7 +1,7 @@
 %%
 %% %CopyrightBegin%
 %%
-%% Copyright Ericsson AB 2018. All Rights Reserved.
+%% Copyright Ericsson AB 2018-2020. All Rights Reserved.
 %%
 %% Licensed under the Apache License, Version 2.0 (the "License");
 %% you may not use this file except in compliance with the License.
@@ -47,14 +47,14 @@ module(#b_module{body=Fs0}=Module, _Opts) ->
 %% the same arguments in the same order, we can shave off a call by short-
 %% circuiting it.
 find_trampolines(#b_function{args=Args,bs=Blocks}=F, Trampolines) ->
-    case maps:get(0, Blocks) of
+    case map_get(0, Blocks) of
         #b_blk{is=[#b_set{op=call,
                           args=[#b_local{}=Actual | Args],
                           dst=Dst}],
                last=#b_ret{arg=Dst}} ->
             {_, Name, Arity} = beam_ssa:get_anno(func_info, F),
             Trampoline = #b_local{name=#b_literal{val=Name},arity=Arity},
-            maps:put(Trampoline, Actual, Trampolines);
+            Trampolines#{Trampoline => Actual};
         _ ->
             Trampolines
     end.
@@ -80,7 +80,7 @@ lfo_analyze_is([#b_set{op=make_fun,
 lfo_analyze_is([#b_set{op=call,
                        args=[Fun | CallArgs]} | Is],
                LFuns) when is_map_key(Fun, LFuns) ->
-    #b_set{args=[#b_local{arity=Arity} | FreeVars]} = maps:get(Fun, LFuns),
+    #b_set{args=[#b_local{arity=Arity} | FreeVars]} = map_get(Fun, LFuns),
     case length(CallArgs) + length(FreeVars) of
         Arity ->
             lfo_analyze_is(Is, maps:without(CallArgs, LFuns));
@@ -94,15 +94,6 @@ lfo_analyze_is([#b_set{args=Args} | Is], LFuns) when map_size(LFuns) =/= 0 ->
     %% to be created anyway, and the slight performance gain from direct calls
     %% is not enough to offset the potential increase in stack frame size (the
     %% free variables need to be kept alive until the call).
-    %%
-    %% This is also a kludge to make HiPE work, as the latter will generate
-    %% code with the assumption that the functions referenced in a make_fun
-    %% will only be used by funs, which will not be the case if we mix it with
-    %% direct calls. See cerl_cconv.erl for details.
-    %%
-    %% Future optimizations like delaying fun creation until use may require us
-    %% to copy affected functions so that HiPE gets its own to play with (until
-    %% HiPE is fixed anyway).
     lfo_analyze_is(Is, maps:without(Args, LFuns));
 lfo_analyze_is([_ | Is], LFuns) ->
     lfo_analyze_is(Is, LFuns);
@@ -133,7 +124,7 @@ lfo_optimize_1([], _LFuns, _Trampolines) ->
 lfo_optimize_is([#b_set{op=call,
                         args=[Fun | CallArgs]}=Call0 | Is],
                 LFuns, Trampolines) when is_map_key(Fun, LFuns) ->
-    #b_set{args=[Local | FreeVars]} = maps:get(Fun, LFuns),
+    #b_set{args=[Local | FreeVars]} = map_get(Fun, LFuns),
     Args = [lfo_short_circuit(Local, Trampolines) | CallArgs ++ FreeVars],
     Call = beam_ssa:add_anno(local_fun_opt, Fun, Call0#b_set{args=Args}),
     [Call | lfo_optimize_is(Is, LFuns, Trampolines)];
@@ -143,7 +134,19 @@ lfo_optimize_is([], _LFuns, _Trampolines) ->
     [].
 
 lfo_short_circuit(Call, Trampolines) ->
-    case maps:find(Call, Trampolines) of
-        {ok, Other} -> lfo_short_circuit(Other, Trampolines);
-        error -> Call
+    lfo_short_circuit(Call, Trampolines, sets:new([{version, 2}])).
+
+lfo_short_circuit(Call, Trampolines, Seen0) ->
+    %% Beware of infinite loops! Get out if this call has been seen before.
+    case sets:is_element(Call, Seen0) of
+        true ->
+            Call;
+        false ->
+            case Trampolines of
+                #{Call := Other} ->
+                    Seen = sets:add_element(Call, Seen0),
+                    lfo_short_circuit(Other, Trampolines, Seen);
+                #{} ->
+                    Call
+            end
     end.

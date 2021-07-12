@@ -21,7 +21,6 @@
 include ./vsn.mk
 
 ifdef TERTIARY_BOOTSTRAP
- INSIDE_ERLSRC = true
  SUBDIRS = src
 else # Normal build
  include ./config.mk
@@ -40,3 +39,5 @@ CLEANDIRS = $(SUBDIRS) api_gen
 SUB_DIRECTORIES=$(SUBDIRS)
 
 include $(ERL_TOP)/make/otp_subdir.mk
+
+include $(ERL_TOP)/make/app_targets.mk

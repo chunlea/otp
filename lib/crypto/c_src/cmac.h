@@ -1,7 +1,7 @@
 /*
  * %CopyrightBegin%
  *
- * Copyright Ericsson AB 2010-2018. All Rights Reserved.
+ * Copyright Ericsson AB 2010-2020. All Rights Reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -23,6 +23,12 @@
 
 #include "common.h"
 
-ERL_NIF_TERM cmac_nif(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[]);
+#if defined(HAVE_CMAC) && !defined(HAVE_EVP_PKEY_new_CMAC_key)
+
+int cmac_low_level(ErlNifEnv* env,
+                   ErlNifBinary key_bin, const EVP_CIPHER* cipher, ErlNifBinary text,
+                   ErlNifBinary *ret_bin, int *ret_bin_alloc, ERL_NIF_TERM *return_term);
+
+#endif
 
 #endif /* E_CMAC_H__ */

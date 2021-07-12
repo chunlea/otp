@@ -1,7 +1,7 @@
 %%
 %% %CopyrightBegin%
 %%
-%% Copyright Ericsson AB 1996-2018. All Rights Reserved.
+%% Copyright Ericsson AB 1996-2020. All Rights Reserved.
 %%
 %% Licensed under the Apache License, Version 2.0 (the "License");
 %% you may not use this file except in compliance with the License.
@@ -21,7 +21,7 @@
 -define(DEFAULT_TIMETRAP_SECS, 60).
 
 %%% TEST_SERVER_CTRL INTERFACE %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
--export([run_test_case_apply/1,init_target_info/0,init_valgrind/0]).
+-export([run_test_case_apply/1,init_target_info/0,init_memory_checker/0]).
 -export([cover_compile/1,cover_analyse/2]).
 
 %%% TEST_SERVER_SUP INTERFACE %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
@@ -39,19 +39,16 @@
 -export([m_out_of_n/3,do_times/4,do_times/2]).
 -export([call_crash/3,call_crash/4,call_crash/5]).
 -export([temp_name/1]).
--export([start_node/3, stop_node/1, wait_for_node/1, is_release_available/1]).
+-export([start_node/3, stop_node/1, wait_for_node/1, is_release_available/1, find_release/1]).
 -export([app_test/1, app_test/2, appup_test/1]).
--export([is_native/1]).
 -export([comment/1, make_priv_dir/0]).
 -export([os_type/0]).
 -export([run_on_shielded_node/2]).
 -export([is_cover/0,is_debug/0,is_commercial/0]).
 
 -export([break/1,break/2,break/3,continue/0,continue/1]).
+-export([memory_checker/0, is_valgrind/0, is_asan/0]).
 
-%%% DEBUGGER INTERFACE %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
--export([valgrind_new_leaks/0, valgrind_format/2,
-	 is_valgrind/0]).
 
 %%% PRIVATE EXPORTED %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
 -export([]).
@@ -59,6 +56,7 @@
 %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
 -include("test_server_internal.hrl").
 -include_lib("kernel/include/file.hrl").
+
 
 init_target_info() ->
     [$.|Emu] = code:objfile_extension(),
@@ -73,8 +71,8 @@ init_target_info() ->
 		 username=test_server_sup:get_username(),
 		 cookie=atom_to_list(erlang:get_cookie())}.
 
-init_valgrind() ->
-    valgrind_new_leaks().
+init_memory_checker() ->
+    check_memory_leaks().
 
 
 %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
@@ -367,25 +365,56 @@ stick_all_sticky(Node,Sticky) ->
 %% cover.
 
 run_test_case_apply({CaseNum,Mod,Func,Args,Name,RunInit,TimetrapData}) ->
-    case is_valgrind() of
-	false ->
-	    ok;
-	true ->
-            valgrind_format("Test case #~w ~w:~w/1", [CaseNum, Mod, Func]),
-	    os:putenv("VALGRIND_LOGFILE_INFIX",atom_to_list(Mod)++"."++
-		      atom_to_list(Func)++"-")
-    end,
+    MC = case {Func, memory_checker()} of
+             {init_per_suite, _} -> none;  % skip init/end_per_suite/group
+             {init_per_group, _} -> none;  % as CaseNum is always 0
+             {end_per_group, _} -> none;
+             {end_per_suite, _} -> none;
+             {_, valgrind} ->
+                 valgrind_format("Test case #~w ~w:~w/1", [CaseNum, Mod, Func]),
+                 os:putenv("VALGRIND_LOGFILE_INFIX",atom_to_list(Mod)++"."++
+                               atom_to_list(Func)++"-"),
+                 valgrind;
+             {_, asan} ->
+                 %% Address sanitizer does not support printf in log file
+                 %% but it lets us change the log file on the fly. So we use
+                 %% that to give each test case its own log file.
+                 case asan_take_logpath() of
+                     false -> false;
+                     {LogPath, OtherOpts} ->
+                         LogDir = filename:dirname(LogPath),
+                         LogFile = filename:basename(LogPath),
+                         [Exe, App | _ ] = string:lexemes(LogFile, "-"),
+                         NewLogFile = io_lib:format("~s-~s-tc-~4..0w-~w-~w",
+                                                    [Exe,App,CaseNum, Mod, Func]),
+                         NewLogPath = filename:join(LogDir, NewLogFile),
+
+                         %% Do leak check and then change asan log file
+                         %% for this running beam executable.
+                         erlang:system_info({memory_checker, check_leaks}),
+                         _PrevLog = erlang:system_info({memory_checker, log, NewLogPath}),
+
+                         %% Set log file name for subnodes
+                         %% that may be created by this test case
+                         NewOpts = asan_make_opts(["log_path="++NewLogPath++".subnode"
+                                                   | OtherOpts]),
+                         os:putenv("ASAN_OPTIONS", NewOpts)
+                 end,
+                 asan;
+             {_, none} ->
+                 node
+         end,
     ProcBef = erlang:system_info(process_count),
     Result = run_test_case_apply(Mod, Func, Args, Name, RunInit,
 				 TimetrapData),
     ProcAft = erlang:system_info(process_count),
-    valgrind_new_leaks(),
+    check_memory_leaks(MC),
     DetFail = get(test_server_detected_fail),
     {Result,DetFail,ProcBef,ProcAft}.
 
 -type tc_status() :: 'starting' | 'running' | 'init_per_testcase' |
-		     'end_per_testcase' | {'framework',atom(),atom()} |
-		     'tc'.
+		     'end_per_testcase' | {'framework',{atom(),atom(),list}} |
+                     'tc'.
 -record(st,
 	{
 	  ref :: reference(),
@@ -653,8 +682,8 @@ handle_tc_exit({testcase_aborted,{user_timetrap_error,_}=Msg,_}, St) ->
     #st{config=Config,mf={Mod,Func},pid=Pid} = St,
     spawn_fw_call(Mod, Func, Config, Pid, Msg, unknown, self()),
     St;
-handle_tc_exit(Reason, #st{status={framework,FwMod,FwFunc},
-			   config=Config,pid=Pid}=St) ->
+handle_tc_exit(Reason, #st{status={framework,{FwMod,FwFunc,_}=FwMFA},
+			   config=Config,mf={Mod,Func},pid=Pid}=St) ->
     R = case Reason of
 	    {timetrap_timeout,TVal,_} ->
 		{timetrap,TVal};
@@ -666,7 +695,7 @@ handle_tc_exit(Reason, #st{status={framework,FwMod,FwFunc},
 		Other
 	end,
     Error = {framework_error,R},
-    spawn_fw_call(FwMod, FwFunc, Config, Pid, Error, unknown, self()),
+    spawn_fw_call(Mod, Func, Config, Pid, {Error,FwMFA}, unknown, self()),
     St;
 handle_tc_exit(Reason, #st{status=tc,config=Config0,mf={Mod,Func},pid=Pid}=St)
   when is_list(Config0) ->
@@ -850,36 +879,68 @@ spawn_fw_call(Mod,EPTC={end_per_testcase,Func},EndConf,Pid,
 				"WARNING: end_per_testcase failed!</font>",
 			    {died,W}
 		    end,
-		try do_end_tc_call(Mod,EPTC,{Pid,Report,[EndConf]}, Why) of
-		    _ -> ok
-		catch
-		    _:FwEndTCErr ->
-			exit({fw_notify_done,end_tc,FwEndTCErr})
-		end,
-		FailLoc = proplists:get_value(tc_fail_loc, EndConf),
+                FailLoc0 = proplists:get_value(tc_fail_loc, EndConf),
+                {RetVal1,FailLoc} =
+                    try do_end_tc_call(Mod,EPTC,{Pid,Report,[EndConf]}, Why) of
+                        Why ->
+                            {RetVal,FailLoc0};
+                        {failed,_} = R ->
+                            {R,[{Mod,Func}]};
+                        R ->
+                            {R,FailLoc0}
+                    catch
+                        _:FwEndTCErr ->
+                            exit({fw_notify_done,end_tc,FwEndTCErr})
+                    end,
 		%% finished, report back (if end_per_testcase fails, a warning
 		%% should be printed as part of the comment)
 		SendTo ! {self(),fw_notify_done,
-			  {Time,RetVal,FailLoc,[],Warn}}
+			  {Time,RetVal1,FailLoc,[],Warn}}
 	end,
     spawn_link(FwCall);
 
-spawn_fw_call(FwMod,FwFunc,_,_Pid,{framework_error,FwError},_,SendTo) ->
+spawn_fw_call(Mod,Func,Conf,Pid,{{framework_error,FwError},
+                                 {FwMod,FwFunc,[A1,A2|_]}=FwMFA},_,SendTo) ->
     FwCall =
 	fun() ->
                 ct_util:mark_process(),
-		test_server_sup:framework_call(report, [framework_error,
-							{{FwMod,FwFunc},
-							 FwError}]),
+                Time =
+                    case FwError of
+                        {timetrap,TVal} ->
+                            TVal/1000;
+                        _ ->
+                            died
+                    end,
+                {Ret,Loc,WarnOrError} =
+                    cleanup_after_fw_error(Mod,Func,Conf,Pid,FwError,FwMFA),
 		Comment =
-		    lists:flatten(
-		      io_lib:format("<font color=\"red\">"
-				    "WARNING! ~w:~tw failed!</font>",
-				    [FwMod,FwFunc])),
+                    case WarnOrError of
+                        warn ->
+			    group_leader() !
+				{printout,12,
+                                 "WARNING! ~w:~tw(~w,~tw,...) failed!\n"
+                                 "    Reason: ~tp\n",
+                                 [FwMod,FwFunc,A1,A2,FwError]},
+                            lists:flatten(
+                              io_lib:format("<font color=\"red\">"
+                                            "WARNING! ~w:~tw(~w,~tw,...) "
+                                            "failed!</font>",
+                                            [FwMod,FwFunc,A1,A2]));
+                        error ->
+			    group_leader() !
+				{printout,12,
+                                 "Error! ~w:~tw(~w,~tw,...) failed!\n"
+                                 "    Reason: ~tp\n",
+                                 [FwMod,FwFunc,A1,A2,FwError]},
+                            lists:flatten(
+                              io_lib:format("<font color=\"red\">"
+                                            "ERROR! ~w:~tw(~w,~tw,...) "
+                                            "failed!</font>",
+                                            [FwMod,FwFunc,A1,A2]))
+                    end,
 	    %% finished, report back
 	    SendTo ! {self(),fw_notify_done,
-		      {died,{error,{FwMod,FwFunc,FwError}},
-		       {FwMod,FwFunc},[],Comment}}
+		      {Time,Ret,Loc,[],Comment}}
 	end,
     spawn_link(FwCall);
 
@@ -902,16 +963,184 @@ spawn_fw_call(Mod,Func,CurrConf,Pid,Error,Loc,SendTo) ->
 			      FwErrorNotifyErr})
 		end,
 		Conf = [{tc_status,{failed,Error}}|CurrConf],
-		try do_end_tc_call(Mod,EndTCFunc,{Pid,Error,[Conf]},Error) of
-		    _ -> ok
-		catch
-		    _:FwEndTCErr ->
-			exit({fw_notify_done,end_tc,FwEndTCErr})
-		end,
+                {Time,RetVal,Loc1} =
+                    try do_end_tc_call(Mod,EndTCFunc,{Pid,Error,[Conf]},Error) of
+                        Error ->
+                            {died, Error, Loc};
+                        {failed,Reason} = NewReturn ->
+                            fw_error_notify(Mod,Func1,Conf,Reason),
+                            {died, NewReturn, [{Mod,Func}]};
+                        NewReturn ->
+                            T = case Error of
+                                    {timetrap_timeout,TT} -> TT;
+                                    _ -> 0
+                                end,
+                            {T, NewReturn, Loc}
+                    catch
+                        _:FwEndTCErr ->
+                            exit({fw_notify_done,end_tc,FwEndTCErr})
+                    end,
 		%% finished, report back
-		SendTo ! {self(),fw_notify_done,{died,Error,Loc,[],undefined}}
+		SendTo ! {self(),fw_notify_done,{Time,RetVal,Loc1,[],undefined}}
 	end,
     spawn_link(FwCall).
+
+cleanup_after_fw_error(_Mod,_Func,Conf,Pid,FwError,
+                       {FwMod,FwFunc=init_tc,
+                        [Mod,{init_per_testcase,Func}=IPTC|_]}) ->
+    %% Failed during pre_init_per_testcase, the test must be skipped
+    Skip = {auto_skip,{failed,{FwMod,FwFunc,FwError}}},
+    try begin do_end_tc_call(Mod,IPTC, {Pid,Skip,[Conf]}, FwError),
+              do_init_tc_call(Mod,{end_per_testcase_not_run,Func},
+                              [Conf],{ok,[Conf]}),
+              do_end_tc_call(Mod,{end_per_testcase_not_run,Func},
+                             {Pid,Skip,[Conf]}, FwError) end of
+        _ -> ok
+    catch
+        _:FwEndTCErr ->
+            exit({fw_notify_done,end_tc,FwEndTCErr})
+    end,
+    {Skip,{FwMod,FwFunc},error};
+cleanup_after_fw_error(_Mod,_Func,Conf,Pid,FwError,
+                       {FwMod,FwFunc=end_tc,[Mod,{init_per_testcase,Func}|_]}) ->
+    %% Failed during post_init_per_testcase, the test must be skipped
+    Skip = {auto_skip,{failed,{FwMod,FwFunc,FwError}}},
+    try begin do_init_tc_call(Mod,{end_per_testcase_not_run,Func},
+                              [Conf],{ok,[Conf]}),
+              do_end_tc_call(Mod,{end_per_testcase_not_run,Func},
+                             {Pid,Skip,[Conf]}, FwError) end of
+        _ -> ok
+    catch
+        _:FwEndTCErr ->
+            exit({fw_notify_done,end_tc,FwEndTCErr})
+    end,
+    {Skip,{FwMod,FwFunc},error};
+cleanup_after_fw_error(_Mod,_Func,Conf,Pid,FwError,
+                       {FwMod,FwFunc=init_tc,[Mod,{end_per_testcase,Func}|_]}) ->
+    %% Failed during pre_end_per_testcase. Warn about it.
+    {RetVal,Loc} =
+        case {proplists:get_value(tc_status, Conf),
+              proplists:get_value(tc_fail_loc, Conf, unknown)} of
+            {undefined,_} ->
+                {{failed,{FwMod,FwFunc,FwError}},{FwMod,FwFunc}};
+            {E = {failed,_Reason},unknown} ->
+                {E,[{Mod,Func}]};
+            {Result,FailLoc} ->
+                {Result,FailLoc}
+        end,
+    try begin do_end_tc_call(Mod,{end_per_testcase_not_run,Func},
+                             {Pid,RetVal,[Conf]}, FwError) end of
+        _ -> ok
+    catch
+        _:FwEndTCErr ->
+            exit({fw_notify_done,end_tc,FwEndTCErr})
+    end,
+    {RetVal,Loc,warn};
+cleanup_after_fw_error(Mod,Func,Conf,Pid,FwError,
+                       {FwMod,FwFunc=end_tc,[Mod,{end_per_testcase,Func}|_]}) ->
+    %% Failed during post_end_per_testcase. Warn about it.
+    {RetVal,Report,Loc} =
+        case {proplists:get_value(tc_status, Conf),
+              proplists:get_value(tc_fail_loc, Conf, unknown)} of
+            {undefined,_} ->
+                {{failed,{FwMod,FwFunc,FwError}},
+                 {{FwMod,FwError},FwError},
+                 {FwMod,FwFunc}};
+            {E = {failed,_Reason},unknown} ->
+                {E,{Mod,Func,E},[{Mod,Func}]};
+            {Result,FailLoc} ->
+                {Result,{Mod,Func,Result},FailLoc}
+        end,
+    try begin do_end_tc_call(Mod,{cleanup,{end_per_testcase_not_run,Func}},
+                             {Pid,RetVal,[Conf]}, FwError) end of
+        _ -> ok
+    catch
+        _:FwEndTCErr ->
+            exit({fw_notify_done,end_tc,FwEndTCErr})
+    end,
+    test_server_sup:framework_call(report,[framework_error,Report]),
+    {RetVal,Loc,warn};
+cleanup_after_fw_error(Mod,Func,Conf,Pid,FwError,{FwMod,FwFunc=init_tc,_})
+  when Func =:= init_per_suite; Func =:=init_per_group ->
+    %% Failed during pre_init_per_suite or pre_init_per_group
+    RetVal = {failed,{FwMod,FwFunc,FwError}},
+    try do_end_tc_call(Mod,Func,{Pid,RetVal,[Conf]},FwError) of
+        _ -> ok
+    catch
+        _:FwEndTCErr ->
+            exit({fw_notify_done,end_tc,FwEndTCErr})
+    end,
+    {RetVal,{FwMod,FwFunc},error};
+cleanup_after_fw_error(Mod,Func,Conf,Pid,FwError,{FwMod,FwFunc=end_tc,_})
+  when Func =:= init_per_suite; Func =:=init_per_group ->
+    %% Failed during post_init_per_suite or post_init_per_group
+    RetVal = {failed,{FwMod,FwFunc,FwError}},
+    try do_end_tc_call(Mod,{cleanup,Func},{Pid,RetVal,[Conf]},FwError) of
+        _ -> ok
+    catch
+        _:FwEndTCErr ->
+            exit({fw_notify_done,end_tc,FwEndTCErr})
+    end,
+    ReportFunc =
+        case Func of
+            init_per_group ->
+                case proplists:get_value(tc_group_properties,Conf) of
+                    undefined ->
+                        {Func,unknown,[]};
+                    GProps ->
+                        Name = proplists:get_value(name,GProps),
+                        {Func,Name,proplists:delete(name,GProps)}
+                end;
+            _ ->
+                Func
+        end,
+    test_server_sup:framework_call(report,[framework_error,
+                                           {Mod,ReportFunc,RetVal}]),
+    {RetVal,{FwMod,FwFunc},error};
+cleanup_after_fw_error(Mod,Func,Conf,Pid,FwError,{FwMod,FwFunc=init_tc,_})
+  when Func =:= end_per_suite; Func =:=end_per_group ->
+    %% Failed during pre_end_per_suite or pre_end_per_group
+    RetVal = {failed,{FwMod,FwFunc,FwError}},
+    try do_end_tc_call(Mod,Func,{Pid,RetVal,[Conf]},FwError) of
+        _ -> ok
+    catch
+        _:FwEndTCErr ->
+            exit({fw_notify_done,end_tc,FwEndTCErr})
+    end,
+    {RetVal,{FwMod,FwFunc},error};
+cleanup_after_fw_error(Mod,Func,Conf,Pid,FwError,{FwMod,FwFunc=end_tc,_})
+  when Func =:= end_per_suite; Func =:=end_per_group ->
+    %% Failed during post_end_per_suite or post_end_per_group
+    RetVal = {failed,{FwMod,FwFunc,FwError}},
+    try do_end_tc_call(Mod,{cleanup,Func},{Pid,RetVal,[Conf]},FwError) of
+        _ -> ok
+    catch
+        _:FwEndTCErr ->
+            exit({fw_notify_done,end_tc,FwEndTCErr})
+    end,
+    ReportFunc =
+        case Func of
+            end_per_group ->
+                case proplists:get_value(tc_group_properties,Conf) of
+                    undefined ->
+                        {Func,unknown,[]};
+                    GProps ->
+                        Name = proplists:get_value(name,GProps),
+                        {Func,Name,proplists:delete(name,GProps)}
+                end;
+            _ ->
+                Func
+        end,
+    test_server_sup:framework_call(report,[framework_error,
+                                           {Mod,ReportFunc,RetVal}]),
+    {RetVal,{FwMod,FwFunc},error};
+cleanup_after_fw_error(_Mod,_Func,_Conf,_Pid,FwError,{FwMod,FwFunc,_}) ->
+    %% This is unexpected
+    test_server_sup:framework_call(report,
+                                   [framework_error,
+                                    {{FwMod,FwFunc},
+                                     FwError}]),
+    {FwError,{FwMod,FwFunc},error}.
 
 %% The job proxy process forwards messages between the test case
 %% process on a shielded node (and its descendants) and the job process.
@@ -1088,6 +1317,9 @@ run_test_case_eval1(Mod, Func, Args, Name, RunInit, TCCallback) ->
 		    EndConf1 =
 			user_callback(TCCallback, Mod, Func, 'end', EndConf),
 
+                    %% save updated config in controller loop
+                    set_tc_state(tc, EndConf1),
+
 		    %% We can't handle fails or skips here
 		    EndConf2 =
 			case do_init_tc_call(Mod,{end_per_testcase,Func},
@@ -1161,23 +1393,29 @@ do_end_tc_call(Mod, IPTC={init_per_testcase,Func}, Res, Return) ->
 	 {NOk,_} when NOk == auto_skip; NOk == fail;
 		      NOk == skip ; NOk == skipped ->
 	     {_,Args} = Res,
-	     IPTCEndRes =
+	     {NewConfig,IPTCEndRes} =
 		 case do_end_tc_call1(Mod, IPTC, Res, Return) of
 		     IPTCEndConfig when is_list(IPTCEndConfig) ->
-			 IPTCEndConfig;
+			 {IPTCEndConfig,IPTCEndConfig};
+                     {failed,RetReason} when Return=:={fail,RetReason} ->
+                         %% Fail reason not changed by framework or hook
+                         {Args,Return};
+                     {SF,_} = IPTCEndResult when SF=:=skip; SF=:=skipped;
+                                                 SF=:=fail; SF=:=failed ->
+                         {Args,IPTCEndResult};
 		     _ ->
-			 Args
+			 {Args,Return}
 		 end,
 	     EPTCInitRes =
 		 case do_init_tc_call(Mod,{end_per_testcase_not_run,Func},
-				      IPTCEndRes,Return) of
+				      NewConfig,IPTCEndRes) of
 		     {ok,EPTCInitConfig} when is_list(EPTCInitConfig) ->
-			 {Return,EPTCInitConfig};
+			 {IPTCEndRes,EPTCInitConfig};
 		     _ ->
-                         {Return,IPTCEndRes}
+                         {IPTCEndRes,NewConfig}
 		 end,
 	     do_end_tc_call1(Mod, {end_per_testcase_not_run,Func},
-			     EPTCInitRes, Return);
+			     EPTCInitRes, IPTCEndRes);
 	 _Ok ->
 	     do_end_tc_call1(Mod, IPTC, Res, Return)
      end;
@@ -1844,7 +2082,8 @@ timetrap_scale_factor() ->
 	{ 3, fun() -> has_superfluous_schedulers() end},
 	{ 6, fun() -> is_debug() end},
 	{10, fun() -> is_cover() end},
-        {10, fun() -> is_valgrind() end}
+        {10, fun() -> is_valgrind() end},
+        {2,  fun() -> is_asan() end}
     ]).
 
 timetrap_scale_factor(Scales) ->
@@ -2527,6 +2766,19 @@ is_release_available(Release) ->
 		      {test_server_ctrl,is_release_available,[Release]}},
     receive {sync_result,R} -> R end.
 
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+%% find_release(Release) -> PathToReleaseErlFile | not_available
+%% Release -> string()
+%%
+%% Test if a release (such as "r10b") and if so return the path to the
+%% release's erl file
+
+find_release(Release) ->
+    group_leader() ! {sync_apply,
+		      self(),
+		      {test_server_ctrl,find_release,[Release]}},
+    receive {sync_result,R} -> R end.
+
 
 %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
 %% run_on_shielded_node(Fun, CArgs) -> term()
@@ -2642,14 +2894,6 @@ appup_test(App) ->
     test_server_sup:appup_test(App).
 
 %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
-%% is_native(Mod) -> true | false
-%%
-%% Checks wether the module is natively compiled or not.
-
-is_native(Mod) ->
-    (catch Mod:module_info(native)) =:= true.
-
-%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
 %% comment(String) -> ok
 %%
 %% The given String will occur in the comment field
@@ -2753,10 +2997,19 @@ is_commercial() ->
 %%
 %% Returns true if valgrind is running, else false
 is_valgrind() ->
-    case catch erlang:system_info({valgrind, running}) of
-	{'EXIT', _} -> false;
-	Res -> Res
+    memory_checker() =:= valgrind.
+
+%% Returns true if address-sanitizer is running, else false
+is_asan() ->
+    memory_checker() =:= asan.
+
+%% Returns the error checker running (valgrind | asan | none).
+memory_checker() ->
+    case catch erlang:system_info({memory_checker, running}) of
+	{'EXIT', _} -> none;
+        EC -> EC
     end.
+
 
 %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
 %%                     DEBUGGER INTERFACE                    %%
@@ -2764,11 +3017,16 @@ is_valgrind() ->
 %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
 
 %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
-%% valgrind_new_leaks() -> ok
+%% check_memory_leaks() -> ok
 %%
-%% Checks for new memory leaks if Valgrind is active.
-valgrind_new_leaks() ->
-    catch erlang:system_info({valgrind, memory}),
+%% Checks for memory leaks if Valgrind or Address-sanitizer is active.
+check_memory_leaks() ->
+    check_memory_leaks(memory_checker()).
+
+check_memory_leaks(valgrind) ->
+    catch erlang:system_info({memory_checker, check_leaks}),
+    ok;
+check_memory_leaks(_) ->
     ok.
 
 %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
@@ -2778,9 +3036,31 @@ valgrind_new_leaks() ->
 %%
 %% Outputs the formatted string to Valgrind's logfile,if Valgrind is active.
 valgrind_format(Format, Args) ->
-    (catch erlang:system_info({valgrind, io_lib:format(Format, Args)})),
+    (catch erlang:system_info({memory_checker, print, io_lib:format(Format, Args)})),
     ok.
 
+asan_take_logpath() ->
+    case os:getenv("ASAN_OPTIONS") of
+        false -> false;
+        S ->
+            Opts = string:lexemes(S, ":"),
+            asan_take_logpath_loop(Opts, [])
+    end.
+
+asan_take_logpath_loop(["log_path="++LogPath | T], Acc) ->
+    {LogPath, T ++ Acc};
+asan_take_logpath_loop([Opt | T], Acc) ->
+    asan_take_logpath_loop(T, [Opt | Acc]);
+asan_take_logpath_loop([], _) ->
+    false.
+
+asan_make_opts([A|T]) ->
+    asan_make_opts(T, A).
+
+asan_make_opts([], Acc) ->
+    Acc;
+asan_make_opts([A|T], Acc) ->
+    asan_make_opts(T, A ++ [$: | Acc]).
 
 
 %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%

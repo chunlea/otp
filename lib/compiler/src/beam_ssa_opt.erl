@@ -1,7 +1,7 @@
 %%
 %% %CopyrightBegin%
 %%
-%% Copyright Ericsson AB 2018. All Rights Reserved.
+%% Copyright Ericsson AB 2018-2020. All Rights Reserved.
 %%
 %% Licensed under the Apache License, Version 2.0 (the "License");
 %% you may not use this file except in compliance with the License.
@@ -28,9 +28,9 @@
 %%% in one phase and then apply it in the next without having to risk working
 %%% with incomplete information.
 %%%
-%%% Each sub-pass operates on a #st{} record and a func_info_db(), where the
-%%% former is just a #b_function{} whose blocks can be represented either in
-%%% linear or map form, and the latter is a map with information about all
+%%% Each sub-pass operates on a #opt_st{} record and a func_info_db(), where
+%%% the former is just a #b_function{} whose blocks can be represented either
+%%% in linear or map form, and the latter is a map with information about all
 %%% functions in the module (see beam_ssa_opt.hrl for more details).
 %%%
 
@@ -39,44 +39,76 @@
 
 -include("beam_ssa_opt.hrl").
 
--import(lists, [all/2,append/1,duplicate/2,foldl/3,keyfind/3,member/2,
-                reverse/1,reverse/2,
+-import(lists, [all/2,append/1,duplicate/2,flatten/1,foldl/3,
+                keyfind/3,last/1,mapfoldl/3,member/2,
+                partition/2,reverse/1,reverse/2,
                 splitwith/2,sort/1,takewhile/2,unzip/1]).
 
--define(DEFAULT_REPETITIONS, 2).
+-define(MAX_REPETITIONS, 16).
 
 -spec module(beam_ssa:b_module(), [compile:option()]) ->
                     {'ok',beam_ssa:b_module()}.
 
--record(st, {ssa :: [{beam_ssa:label(),beam_ssa:b_blk()}] |
-                    beam_ssa:block_map(),
-             args :: [beam_ssa:b_var()],
-             cnt :: beam_ssa:label(),
-             anno :: beam_ssa:anno()}).
--type st_map() :: #{ func_id() => #st{} }.
-
 module(Module, Opts) ->
-    FuncDb0 = case proplists:get_value(no_module_opt, Opts, false) of
-                  false -> build_func_db(Module);
-                  true -> #{}
-              end,
+    FuncDb = case proplists:get_value(no_module_opt, Opts, false) of
+                 false -> build_func_db(Module);
+                 true -> #{}
+             end,
 
     %% Passes that perform module-level optimizations are often aided by
     %% optimizing callers before callees and vice versa, so we optimize all
-    %% functions in call order, flipping it as required.
+    %% functions in call order, alternating the order every time.
     StMap0 = build_st_map(Module),
-    Order = get_call_order_po(StMap0, FuncDb0),
+    Order = get_call_order_po(StMap0, FuncDb),
 
-    Phases =
-        [{Order, prologue_passes(Opts)}] ++
-        repeat(Opts, repeated_passes(Opts), Order) ++
-        [{Order, epilogue_passes(Opts)}],
+    Phases = [{once, Order, prologue_passes(Opts)},
+              {module, module_passes(Opts)},
+              {fixpoint, Order, repeated_passes(Opts)},
+              {once, Order, epilogue_passes(Opts)}],
 
-    {StMap, _FuncDb} = foldl(fun({FuncIds, Ps}, {StMap, FuncDb}) ->
-                                     phase(FuncIds, Ps, StMap, FuncDb)
-                             end, {StMap0, FuncDb0}, Phases),
-
+    StMap = run_phases(Phases, StMap0, FuncDb),
     {ok, finish(Module, StMap)}.
+
+run_phases([{module, Passes} | Phases], StMap0, FuncDb0) ->
+    {StMap, FuncDb} = compile:run_sub_passes(Passes, {StMap0, FuncDb0}),
+    run_phases(Phases, StMap, FuncDb);
+run_phases([{once, FuncIds0, Passes} | Phases], StMap0, FuncDb0) ->
+    FuncIds = skip_removed(FuncIds0, StMap0),
+    {StMap, FuncDb} = phase(FuncIds, Passes, StMap0, FuncDb0),
+    run_phases(Phases, StMap, FuncDb);
+run_phases([{fixpoint, FuncIds0, Passes} | Phases], StMap0, FuncDb0) ->
+    FuncIds = skip_removed(FuncIds0, StMap0),
+    RevFuncIds = reverse(FuncIds),
+    Order = {FuncIds, RevFuncIds},
+    {StMap, FuncDb} = fixpoint(RevFuncIds, Order, Passes,
+                               StMap0, FuncDb0, ?MAX_REPETITIONS),
+    run_phases(Phases, StMap, FuncDb);
+run_phases([], StMap, _FuncDb) ->
+    StMap.
+
+skip_removed(FuncIds, StMap) ->
+    [F || F <- FuncIds, is_map_key(F, StMap)].
+
+%% Run the given passes until a fixpoint is reached.
+fixpoint(_FuncIds, _Order, _Passes, StMap, FuncDb, 0) ->
+    %% Too many repetitions. Give up and return what we have.
+    {StMap, FuncDb};
+fixpoint(FuncIds0, Order0, Passes, StMap0, FuncDb0, N) ->
+    {StMap, FuncDb} = phase(FuncIds0, Passes, StMap0, FuncDb0),
+    Repeat = changed(FuncIds0, FuncDb0, FuncDb, StMap0, StMap),
+    case sets:is_empty(Repeat) of
+        true ->
+            %% No change. Fixpoint reached.
+            {StMap, FuncDb};
+        false ->
+            %% Repeat the optimizations for functions whose code has
+            %% changed or for which there is potentially updated type
+            %% information.
+            {OrderA, OrderB} = Order0,
+            Order = {OrderB, OrderA},
+            FuncIds = [Id || Id <- OrderA, sets:is_element(Id, Repeat)],
+            fixpoint(FuncIds, Order, Passes, StMap, FuncDb, N - 1)
+    end.
 
 phase([FuncId | Ids], Ps, StMap, FuncDb0) ->
     try compile:run_sub_passes(Ps, {map_get(FuncId, StMap), FuncDb0}) of
@@ -84,26 +116,101 @@ phase([FuncId | Ids], Ps, StMap, FuncDb0) ->
             phase(Ids, Ps, StMap#{ FuncId => St }, FuncDb)
     catch
         Class:Error:Stack ->
-            #b_local{name=Name,arity=Arity} = FuncId,
+            #b_local{name=#b_literal{val=Name},arity=Arity} = FuncId,
             io:fwrite("Function: ~w/~w\n", [Name,Arity]),
             erlang:raise(Class, Error, Stack)
     end;
 phase([], _Ps, StMap, FuncDb) ->
     {StMap, FuncDb}.
 
-%% Repeats the given passes, alternating the order between runs to make the
-%% type pass more efficient.
-repeat(Opts, Ps, OrderA) ->
-    Repeat = proplists:get_value(ssa_opt_repeat, Opts, ?DEFAULT_REPETITIONS),
-    OrderB = reverse(OrderA),
-    repeat_1(Repeat, Ps, OrderA, OrderB).
+changed(PrevIds, FuncDb0, FuncDb, StMap0, StMap) ->
+    %% Find all functions in FuncDb that can be reached by changes
+    %% of argument and/or return types. Those are the functions that
+    %% may gain from running the optimization passes again.
+    %%
+    %% Note that we examine all functions in FuncDb, not only functions
+    %% optimized in the previous run, because the argument types can
+    %% have been updated for functions not included in the previous run.
 
-repeat_1(0, _Opts, _OrderA, _OrderB) ->
-    [];
-repeat_1(N, Ps, OrderA, OrderB) when N > 0, N rem 2 =:= 0 ->
-    [{OrderA, Ps} | repeat_1(N - 1, Ps, OrderA, OrderB)];
-repeat_1(N, Ps, OrderA, OrderB) when N > 0, N rem 2 =:= 1 ->
-    [{OrderB, Ps} | repeat_1(N - 1, Ps, OrderA, OrderB)].
+    F = fun(Id, A) ->
+                case sets:is_element(Id, A) of
+                    true ->
+                        A;
+                    false ->
+                        {#func_info{arg_types=ATs0,succ_types=ST0},
+                         #func_info{arg_types=ATs1,succ_types=ST1}} =
+                            {map_get(Id, FuncDb0),map_get(Id, FuncDb)},
+
+                        %% If the argument types have changed for this
+                        %% function, re-optimize this function and all
+                        %% functions it calls directly or indirectly.
+                        %%
+                        %% If the return type has changed, re-optimize
+                        %% this function and all functions that call
+                        %% this function directly or indirectly.
+                        Opts = case ATs0 =:= ATs1 of
+                                    true -> [];
+                                    false -> [called]
+                                end ++
+                            case ST0 =:= ST1 of
+                                true -> [];
+                                false -> [callers]
+                            end,
+                        case Opts of
+                            [] -> A;
+                            [_|_] -> add_changed([Id], Opts, FuncDb, A)
+                        end
+                end
+        end,
+    Ids = foldl(F, sets:new([{version, 2}]), maps:keys(FuncDb)),
+
+    %% From all functions that were optimized in the previous run,
+    %% find the functions that had any change in the SSA code. Those
+    %% functions might gain from being optimized again. (For example,
+    %% when beam_ssa_dead has shortcut branches, the types for some
+    %% variables could become narrower, giving beam_ssa_type new
+    %% opportunities for optimization.)
+    %%
+    %% Note that the functions examined could be functions with module-level
+    %% optimization turned off (and thus not included in FuncDb).
+
+    foldl(fun(Id, A) ->
+                  case sets:is_element(Id, A) of
+                      true ->
+                          %% Already scheduled for another optimization.
+                          %% No need to compare the SSA code.
+                          A;
+                      false ->
+                          %% Compare the SSA code before and after optimization.
+                          case {map_get(Id, StMap0),map_get(Id, StMap)} of
+                              {Same,Same} -> A;
+                              {_,_} -> sets:add_element(Id, A)
+                          end
+                  end
+          end, Ids, PrevIds).
+
+add_changed([Id|Ids], Opts, FuncDb, S0) when is_map_key(Id, FuncDb) ->
+    case sets:is_element(Id, S0) of
+        true ->
+            add_changed(Ids, Opts, FuncDb, S0);
+        false ->
+            S1 = sets:add_element(Id, S0),
+            #func_info{in=In,out=Out} = map_get(Id, FuncDb),
+            S2 = case member(callers, Opts) of
+                     true -> add_changed(In, Opts, FuncDb, S1);
+                     false -> S1
+                 end,
+            S = case member(called, Opts) of
+                    true -> add_changed(Out, Opts, FuncDb, S2);
+                    false -> S2
+                end,
+            add_changed(Ids, Opts, FuncDb, S)
+    end;
+add_changed([_|Ids], Opts, FuncDb, S) ->
+    %% This function is exempt from module-level optimization and will not
+    %% provide any more information.
+    add_changed(Ids, Opts, FuncDb, S);
+add_changed([], _, _, S) -> S.
 
 %%
 
@@ -117,7 +224,7 @@ build_st_map(#b_module{body=Fs}) ->
 
 build_st_map_1([F | Fs], Map) ->
     #b_function{anno=Anno,args=Args,cnt=Counter,bs=Bs} = F,
-    St = #st{anno=Anno,args=Args,cnt=Counter,ssa=Bs},
+    St = #opt_st{anno=Anno,args=Args,cnt=Counter,ssa=Bs},
     build_st_map_1(Fs, Map#{ get_func_id(F) => St });
 build_st_map_1([], Map) ->
     Map.
@@ -127,9 +234,14 @@ finish(#b_module{body=Fs0}=Module, StMap) ->
     Module#b_module{body=finish_1(Fs0, StMap)}.
 
 finish_1([F0 | Fs], StMap) ->
-    #st{anno=Anno,cnt=Counter,ssa=Blocks} = map_get(get_func_id(F0), StMap),
-    F = F0#b_function{anno=Anno,bs=Blocks,cnt=Counter},
-    [F | finish_1(Fs, StMap)];
+    FuncId = get_func_id(F0),
+    case StMap of
+        #{ FuncId := #opt_st{anno=Anno,cnt=Counter,ssa=Blocks} } ->
+            F = F0#b_function{anno=Anno,bs=Blocks,cnt=Counter},
+            [F | finish_1(Fs, StMap)];
+        #{} ->
+            finish_1(Fs, StMap)
+    end;
 finish_1([], _StMap) ->
     [].
 
@@ -145,18 +257,34 @@ prologue_passes(Opts) ->
           ?PASS(ssa_opt_linearize),
           ?PASS(ssa_opt_tuple_size),
           ?PASS(ssa_opt_record),
-          ?PASS(ssa_opt_cse),                   %Helps the first type pass.
-          ?PASS(ssa_opt_type_start)],
+          ?PASS(ssa_opt_cse),                   % Helps the first type pass.
+          ?PASS(ssa_opt_live)],                 % ...
     passes_1(Ps, Opts).
+
+module_passes(Opts) ->
+    Ps0 = [{ssa_opt_bc_size,
+            fun({StMap, FuncDb}) ->
+                    {beam_ssa_bc_size:opt(StMap), FuncDb}
+            end},
+           {ssa_opt_type_start,
+            fun({StMap, FuncDb}) ->
+                    beam_ssa_type:opt_start(StMap, FuncDb)
+            end}],
+    passes_1(Ps0, Opts).
 
 %% These passes all benefit from each other (in roughly this order), so they
 %% are repeated as required.
 repeated_passes(Opts) ->
     Ps = [?PASS(ssa_opt_live),
+          ?PASS(ssa_opt_ne),
           ?PASS(ssa_opt_bs_puts),
           ?PASS(ssa_opt_dead),
           ?PASS(ssa_opt_cse),
           ?PASS(ssa_opt_tail_phis),
+          ?PASS(ssa_opt_sink),
+          ?PASS(ssa_opt_tuple_size),
+          ?PASS(ssa_opt_record),
+          ?PASS(ssa_opt_try),
           ?PASS(ssa_opt_type_continue)],        %Must run after ssa_opt_dead to
                                                 %clean up phi nodes.
     passes_1(Ps, Opts).
@@ -164,16 +292,20 @@ repeated_passes(Opts) ->
 epilogue_passes(Opts) ->
     Ps = [?PASS(ssa_opt_type_finish),
           ?PASS(ssa_opt_float),
-          ?PASS(ssa_opt_live),                  %One last time to clean up the
-                                                %mess left by the float pass.
-          ?PASS(ssa_opt_bsm),
-          ?PASS(ssa_opt_bsm_units),
-          ?PASS(ssa_opt_bsm_shortcut),
           ?PASS(ssa_opt_sw),
-          ?PASS(ssa_opt_blockify),
+
+          %% Run live one more time to clean up after the previous
+          %% epilogue passes.
+          ?PASS(ssa_opt_live),
+          ?PASS(ssa_opt_bsm),
+          ?PASS(ssa_opt_bsm_shortcut),
           ?PASS(ssa_opt_sink),
+          ?PASS(ssa_opt_blockify),
           ?PASS(ssa_opt_merge_blocks),
-          ?PASS(ssa_opt_trim_unreachable)],
+          ?PASS(ssa_opt_get_tuple_element),
+          ?PASS(ssa_opt_tail_calls),
+          ?PASS(ssa_opt_trim_unreachable),
+          ?PASS(ssa_opt_unfold_literals)],
     passes_1(Ps, Opts).
 
 passes_1(Ps, Opts0) ->
@@ -191,16 +323,26 @@ passes_1(Ps, Opts0) ->
 %% Builds a function information map with basic information about incoming and
 %% outgoing local calls, as well as whether the function is exported.
 -spec build_func_db(#b_module{}) -> func_info_db().
-build_func_db(#b_module{body=Fs,exports=Exports}) ->
+build_func_db(#b_module{body=Fs,attributes=Attr,exports=Exports0}) ->
+    Exports = fdb_exports(Attr, Exports0),
     try
-        fdb_1(Fs, gb_sets:from_list(Exports), #{})
+        fdb_fs(Fs, Exports, #{})
     catch
         %% All module-level optimizations are invalid when a NIF can override a
         %% function, so we have to bail out.
         throw:load_nif -> #{}
     end.
 
-fdb_1([#b_function{ args=Args,bs=Bs }=F | Fs], Exports, FuncDb0) ->
+fdb_exports([{on_load, L} | Attrs], Exports) ->
+    %% Functions marked with on_load must be treated as exported to prevent
+    %% them from being optimized away when unused.
+    fdb_exports(Attrs, flatten(L) ++ Exports);
+fdb_exports([_Attr | Attrs], Exports) ->
+    fdb_exports(Attrs, Exports);
+fdb_exports([], Exports) ->
+    gb_sets:from_list(Exports).
+
+fdb_fs([#b_function{ args=Args,bs=Bs }=F | Fs], Exports, FuncDb0) ->
     Id = get_func_id(F),
 
     #b_local{name=#b_literal{val=Name}, arity=Arity} = Id,
@@ -217,12 +359,13 @@ fdb_1([#b_function{ args=Args,bs=Bs }=F | Fs], Exports, FuncDb0) ->
                                                   arg_types=ArgTypes }}
               end,
 
-    FuncDb = beam_ssa:fold_rpo(fun(_L, #b_blk{is=Is}, FuncDb) ->
+    RPO = beam_ssa:rpo(Bs),
+    FuncDb = beam_ssa:fold_blocks(fun(_L, #b_blk{is=Is}, FuncDb) ->
                                        fdb_is(Is, Id, FuncDb)
-                               end, FuncDb1, Bs),
+                               end, RPO, FuncDb1, Bs),
 
-    fdb_1(Fs, Exports, FuncDb);
-fdb_1([], _Exports, FuncDb) ->
+    fdb_fs(Fs, Exports, FuncDb);
+fdb_fs([], _Exports, FuncDb) ->
     FuncDb.
 
 fdb_is([#b_set{op=call,
@@ -234,6 +377,13 @@ fdb_is([#b_set{op=call,
                                name=#b_literal{val=load_nif}},
                      _Path, _LoadInfo]} | _Is], _Caller, _FuncDb) ->
     throw(load_nif);
+fdb_is([#b_set{op=MakeFun,
+               args=[#b_local{}=Callee | _]} | Is],
+       Caller, FuncDb) when MakeFun =:= make_fun;
+                            MakeFun =:= old_make_fun ->
+    %% The make_fun instruction's type depends on the return type of the
+    %% function in question, so we treat this as a function call.
+    fdb_is(Is, Caller, fdb_update(Caller, Callee, FuncDb));
 fdb_is([_ | Is], Caller, FuncDb) ->
     fdb_is(Is, Caller, FuncDb);
 fdb_is([], _Caller, FuncDb) ->
@@ -249,22 +399,14 @@ fdb_update(Caller, Callee, FuncDb) ->
     FuncDb#{ Caller => CallerVertex#func_info{out=Calls},
              Callee => CalleeVertex#func_info{in=CalledBy} }.
 
-%% Returns the post-order of all local calls in this module. That is, it starts
-%% with the functions that don't call any others and then walks up the call
-%% chain.
+%% Returns the post-order of all local calls in this module. That is,
+%% called functions will be ordered before the functions calling them.
 %%
 %% Functions where module-level optimization is disabled are added last in
 %% arbitrary order.
 
 get_call_order_po(StMap, FuncDb) ->
-    Leaves = maps:fold(fun(Id, #func_info{out=[]}, Acc) ->
-                               [Id | Acc];
-                          (_, _, Acc) ->
-                               Acc
-                       end, [], FuncDb),
-
-    Order = gco_po_1(sort(Leaves), FuncDb, [], #{}),
-
+    Order = gco_po(FuncDb),
     Order ++ maps:fold(fun(K, _V, Acc) ->
                                case is_map_key(K, FuncDb) of
                                    false -> [K | Acc];
@@ -272,48 +414,52 @@ get_call_order_po(StMap, FuncDb) ->
                                end
                        end, [], StMap).
 
-gco_po_1([Id | Ids], FuncDb, Children, Seen) when not is_map_key(Id, Seen) ->
-    [Id | gco_po_1(Ids, FuncDb, [Id | Children], Seen#{ Id => true })];
-gco_po_1([_Id | Ids], FuncDb, Children, Seen) ->
-    gco_po_1(Ids, FuncDb, Children, Seen);
-gco_po_1([], FuncDb, [_|_]=Children, Seen) ->
-    gco_po_1(gco_po_parents(Children, FuncDb), FuncDb, [], Seen);
-gco_po_1([], _FuncDb, [], _Seen) ->
-    [].
+gco_po(FuncDb) ->
+    All = sort(maps:keys(FuncDb)),
+    {RPO,_} = gco_rpo(All, FuncDb, sets:new([{version, 2}]), []),
+    reverse(RPO).
 
-gco_po_parents([Child | Children], FuncDb) ->
-    #{ Child := #func_info{in=Parents}} = FuncDb,
-    Parents ++ gco_po_parents(Children, FuncDb);
-gco_po_parents([], _FuncDb) ->
-    [].
+gco_rpo([Id|Ids], FuncDb, Seen0, Acc0) ->
+    case sets:is_element(Id, Seen0) of
+        true ->
+            gco_rpo(Ids, FuncDb, Seen0, Acc0);
+        false ->
+            #func_info{out=Successors} = map_get(Id, FuncDb),
+            Seen1 = sets:add_element(Id, Seen0),
+            {Acc,Seen} = gco_rpo(Successors, FuncDb, Seen1, Acc0),
+            gco_rpo(Ids, FuncDb, Seen, [Id|Acc])
+    end;
+gco_rpo([], _, Seen, Acc) ->
+    {Acc,Seen}.
 
 %%%
 %%% Trivial sub passes.
 %%%
 
-ssa_opt_dead({#st{ssa=Linear}=St, FuncDb}) ->
-    {St#st{ssa=beam_ssa_dead:opt(Linear)}, FuncDb}.
+ssa_opt_dead({#opt_st{ssa=Linear}=St, FuncDb}) ->
+    {St#opt_st{ssa=beam_ssa_dead:opt(Linear)}, FuncDb}.
 
-ssa_opt_linearize({#st{ssa=Blocks}=St, FuncDb}) ->
-    {St#st{ssa=beam_ssa:linearize(Blocks)}, FuncDb}.
+ssa_opt_linearize({#opt_st{ssa=Blocks}=St, FuncDb}) ->
+    {St#opt_st{ssa=beam_ssa:linearize(Blocks)}, FuncDb}.
 
-ssa_opt_type_start({#st{ssa=Linear0,args=Args,anno=Anno}=St0, FuncDb0}) ->
-    {Linear, FuncDb} = beam_ssa_type:opt_start(Linear0, Args, Anno, FuncDb0),
-    {St0#st{ssa=Linear}, FuncDb}.
-
-ssa_opt_type_continue({#st{ssa=Linear0,args=Args,anno=Anno}=St0, FuncDb0}) ->
+ssa_opt_type_continue({#opt_st{ssa=Linear0,args=Args,anno=Anno}=St0, FuncDb0}) ->
     {Linear, FuncDb} = beam_ssa_type:opt_continue(Linear0, Args, Anno, FuncDb0),
-    {St0#st{ssa=Linear}, FuncDb}.
+    {St0#opt_st{ssa=Linear}, FuncDb}.
 
-ssa_opt_type_finish({#st{args=Args,anno=Anno0}=St0, FuncDb0}) ->
+ssa_opt_type_finish({#opt_st{args=Args,anno=Anno0}=St0, FuncDb0}) ->
     {Anno, FuncDb} = beam_ssa_type:opt_finish(Args, Anno0, FuncDb0),
-    {St0#st{anno=Anno}, FuncDb}.
+    {St0#opt_st{anno=Anno}, FuncDb}.
 
-ssa_opt_blockify({#st{ssa=Linear}=St, FuncDb}) ->
-    {St#st{ssa=maps:from_list(Linear)}, FuncDb}.
+ssa_opt_blockify({#opt_st{ssa=Linear}=St, FuncDb}) ->
+    {St#opt_st{ssa=maps:from_list(Linear)}, FuncDb}.
 
-ssa_opt_trim_unreachable({#st{ssa=Blocks}=St, FuncDb}) ->
-    {St#st{ssa=beam_ssa:trim_unreachable(Blocks)}, FuncDb}.
+ssa_opt_trim_unreachable({#opt_st{ssa=Blocks}=St, FuncDb}) ->
+    {St#opt_st{ssa=beam_ssa:trim_unreachable(Blocks)}, FuncDb}.
+
+ssa_opt_merge_blocks({#opt_st{ssa=Blocks0}=St, FuncDb}) ->
+    RPO = beam_ssa:rpo(Blocks0),
+    Blocks = beam_ssa:merge_blocks(RPO, Blocks0),
+    {St#opt_st{ssa=Blocks}, FuncDb}.
 
 %%%
 %%% Split blocks before certain instructions to enable more optimizations.
@@ -325,14 +471,17 @@ ssa_opt_trim_unreachable({#st{ssa=Blocks}=St, FuncDb}) ->
 %%% for sinking get_tuple_element instructions.
 %%%
 
-ssa_opt_split_blocks({#st{ssa=Blocks0,cnt=Count0}=St, FuncDb}) ->
+ssa_opt_split_blocks({#opt_st{ssa=Blocks0,cnt=Count0}=St, FuncDb}) ->
     P = fun(#b_set{op={bif,element}}) -> true;
            (#b_set{op=call}) -> true;
+           (#b_set{op=bs_init_writable}) -> true;
            (#b_set{op=make_fun}) -> true;
+           (#b_set{op=old_make_fun}) -> true;
            (_) -> false
         end,
-    {Blocks,Count} = beam_ssa:split_blocks(P, Blocks0, Count0),
-    {St#st{ssa=Blocks,cnt=Count}, FuncDb}.
+    RPO = beam_ssa:rpo(Blocks0),
+    {Blocks,Count} = beam_ssa:split_blocks(RPO, P, Blocks0, Count0),
+    {St#opt_st{ssa=Blocks,cnt=Count}, FuncDb}.
 
 %%%
 %%% Coalesce phi nodes.
@@ -356,13 +505,13 @@ ssa_opt_split_blocks({#st{ssa=Blocks0,cnt=Count0}=St, FuncDb}) ->
 %%% different registers).
 %%%
 
-ssa_opt_coalesce_phis({#st{ssa=Blocks0}=St, FuncDb}) ->
+ssa_opt_coalesce_phis({#opt_st{ssa=Blocks0}=St, FuncDb}) ->
     Ls = beam_ssa:rpo(Blocks0),
     Blocks = c_phis_1(Ls, Blocks0),
-    {St#st{ssa=Blocks}, FuncDb}.
+    {St#opt_st{ssa=Blocks}, FuncDb}.
 
 c_phis_1([L|Ls], Blocks0) ->
-    case maps:get(L, Blocks0) of
+    case map_get(L, Blocks0) of
         #b_blk{is=[#b_set{op=phi}|_]}=Blk ->
             Blocks = c_phis_2(L, Blk, Blocks0),
             c_phis_1(Ls, Blocks);
@@ -401,7 +550,7 @@ c_phis_args_1([{Var,Pred}|As], Blocks) ->
 c_phis_args_1([], _Blocks) -> none.
 
 c_get_pred_vars(Var, Pred, Blocks) ->
-    case maps:get(Pred, Blocks) of
+    case map_get(Pred, Blocks) of
         #b_blk{is=[#b_set{op=phi,dst=Var,args=Args}]} ->
             {Var,Pred,Args};
         #b_blk{} ->
@@ -422,7 +571,7 @@ c_rewrite_phi([A|As], Info) ->
 c_rewrite_phi([], _Info) -> [].
 
 c_fix_branches([{_,Pred}|As], L, Blocks0) ->
-    #b_blk{last=Last0} = Blk0 = maps:get(Pred, Blocks0),
+    #b_blk{last=Last0} = Blk0 = map_get(Pred, Blocks0),
     #b_br{bool=#b_literal{val=true}} = Last0,   %Assertion.
     Last = Last0#b_br{bool=#b_literal{val=true},succ=L,fail=L},
     Blk = Blk0#b_blk{last=Last},
@@ -462,9 +611,9 @@ c_fix_branches([], _, Blocks) -> Blocks.
 %%%   - Smaller stack frames
 %%%
 
-ssa_opt_tail_phis({#st{ssa=SSA0,cnt=Count0}=St, FuncDb}) ->
+ssa_opt_tail_phis({#opt_st{ssa=SSA0,cnt=Count0}=St, FuncDb}) ->
     {SSA,Count} = opt_tail_phis(SSA0, Count0),
-    {St#st{ssa=SSA,cnt=Count}, FuncDb}.
+    {St#opt_st{ssa=SSA,cnt=Count}, FuncDb}.
 
 opt_tail_phis(Blocks, Count) when is_map(Blocks) ->
     opt_tail_phis(maps:values(Blocks), Blocks, Count);
@@ -516,28 +665,15 @@ reduce_phis([]) -> [].
 opt_tail_phi_arg({PredL,Sub0}, Is0, Ret0, {Blocks0,Count0,Cost0}) ->
     Blk0 = map_get(PredL, Blocks0),
     #b_blk{is=IsPrefix,last=#b_br{succ=Next,fail=Next}} = Blk0,
-    case is_exit_bif(IsPrefix) of
-        false ->
-            Sub1 = maps:from_list(Sub0),
-            {Is1,Count,Sub} = new_names(Is0, Sub1, Count0, []),
-            Is2 = [sub(I, Sub) || I <- Is1],
-            Cost = build_cost(Is2, Cost0),
-            Is = IsPrefix ++ Is2,
-            Ret = sub(Ret0, Sub),
-            Blk = Blk0#b_blk{is=Is,last=Ret},
-            Blocks = Blocks0#{PredL:=Blk},
-            {Blocks,Count,Cost};
-        true ->
-            %% The block ends in a call to a function that
-            %% will cause an exception.
-            {Blocks0,Count0,Cost0+3}
-    end.
-
-is_exit_bif([#b_set{op=call,
-                    args=[#b_remote{mod=#b_literal{val=Mod},
-                                    name=#b_literal{val=Name}}|Args]}]) ->
-    erl_bifs:is_exit_bif(Mod, Name, length(Args));
-is_exit_bif(_) -> false.
+    Sub1 = maps:from_list(Sub0),
+    {Is1,Count,Sub} = new_names(Is0, Sub1, Count0, []),
+    Is2 = [sub(I, Sub) || I <- Is1],
+    Cost = build_cost(Is2, Cost0),
+    Is = IsPrefix ++ Is2,
+    Ret = sub(Ret0, Sub),
+    Blk = Blk0#b_blk{is=Is,last=Ret},
+    Blocks = Blocks0#{PredL:=Blk},
+    {Blocks,Count,Cost}.
 
 new_names([#b_set{dst=Dst}=I|Is], Sub0, Count0, Acc) ->
     {NewDst,Count} = new_var(Dst, Count0),
@@ -593,7 +729,7 @@ are_all_literals(Args) ->
 %%% be replaced with get_tuple_element/3 instructions.
 %%%
 
-ssa_opt_element({#st{ssa=Blocks}=St, FuncDb}) ->
+ssa_opt_element({#opt_st{ssa=Blocks}=St, FuncDb}) ->
     %% Collect the information about element instructions in this
     %% function.
     GetEls = collect_element_calls(beam_ssa:linearize(Blocks)),
@@ -605,13 +741,13 @@ ssa_opt_element({#st{ssa=Blocks}=St, FuncDb}) ->
 
     %% For each chain, swap the first element call with the
     %% element call with the highest index.
-    {St#st{ssa=swap_element_calls(Chains, Blocks)}, FuncDb}.
+    {St#opt_st{ssa=swap_element_calls(Chains, Blocks)}, FuncDb}.
 
 collect_element_calls([{L,#b_blk{is=Is0,last=Last}}|Bs]) ->
     case {Is0,Last} of
         {[#b_set{op={bif,element},dst=Element,
                  args=[#b_literal{val=N},#b_var{}=Tuple]},
-          #b_set{op=succeeded,dst=Bool,args=[Element]}],
+          #b_set{op={succeeded,guard},dst=Bool,args=[Element]}],
          #b_br{bool=Bool,succ=Succ,fail=Fail}} ->
             Info = {L,Succ,{Tuple,Fail},N},
             [Info|collect_element_calls(Bs)];
@@ -666,9 +802,9 @@ swap_element_calls_1([], _, Blocks) ->
 %%% when applicable.
 %%%
 
-ssa_opt_record({#st{ssa=Linear}=St, FuncDb}) ->
+ssa_opt_record({#opt_st{ssa=Linear}=St, FuncDb}) ->
     Blocks = maps:from_list(Linear),
-    {St#st{ssa=record_opt(Linear, Blocks)}, FuncDb}.
+    {St#opt_st{ssa=record_opt(Linear, Blocks)}, FuncDb}.
 
 record_opt([{L,#b_blk{is=Is0,last=Last}=Blk0}|Bs], Blocks) ->
     Is = record_opt_is(Is0, Last, Blocks),
@@ -685,6 +821,14 @@ record_opt_is([#b_set{op={bif,is_tuple},dst=Bool,args=[Tuple]}=Set],
         no ->
             [Set]
     end;
+record_opt_is([I|Is]=Is0, #b_br{bool=Bool}=Last, Blocks) ->
+    case is_tagged_tuple_1(Is0, Last, Blocks) of
+        {yes,_Fail,Tuple,Arity,Tag} ->
+            Args = [Tuple,Arity,Tag],
+            [I#b_set{op=is_tagged_tuple,dst=Bool,args=Args}];
+        no ->
+            [I|record_opt_is(Is, Last, Blocks)]
+    end;
 record_opt_is([I|Is], Last, Blocks) ->
     [I|record_opt_is(Is, Last, Blocks)];
 record_opt_is([], _Last, _Blocks) -> [].
@@ -692,29 +836,30 @@ record_opt_is([], _Last, _Blocks) -> [].
 is_tagged_tuple(#b_var{}=Tuple, Bool,
                 #b_br{bool=Bool,succ=Succ,fail=Fail},
                 Blocks) ->
-    SuccBlk = maps:get(Succ, Blocks),
-    is_tagged_tuple_1(SuccBlk, Tuple, Fail, Blocks);
+    #b_blk{is=Is,last=Last} = map_get(Succ, Blocks),
+    case is_tagged_tuple_1(Is, Last, Blocks) of
+        {yes,Fail,Tuple,Arity,Tag} ->
+            {yes,Arity,Tag};
+        _ ->
+            no
+    end;
 is_tagged_tuple(_, _, _, _) -> no.
 
-is_tagged_tuple_1(#b_blk{is=Is,last=Last}, Tuple, Fail, Blocks) ->
-    case Is of
-        [#b_set{op={bif,tuple_size},dst=ArityVar,
-                args=[#b_var{}=Tuple]},
-         #b_set{op={bif,'=:='},
-                dst=Bool,
-                args=[ArityVar, #b_literal{val=ArityVal}=Arity]}]
-        when is_integer(ArityVal) ->
-            case Last of
-                #b_br{bool=Bool,succ=Succ,fail=Fail} ->
-                    SuccBlk = maps:get(Succ, Blocks),
-                    case is_tagged_tuple_2(SuccBlk, Tuple, Fail) of
-                        no ->
-                            no;
-                        {yes,Tag} ->
-                            {yes,Arity,Tag}
-                    end;
-                _ ->
-                    no
+is_tagged_tuple_1(Is, Last, Blocks) ->
+    case {Is,Last} of
+        {[#b_set{op={bif,tuple_size},dst=ArityVar,
+                 args=[#b_var{}=Tuple]},
+          #b_set{op={bif,'=:='},
+                 dst=Bool,
+                 args=[ArityVar, #b_literal{val=ArityVal}=Arity]}],
+         #b_br{bool=Bool,succ=Succ,fail=Fail}}
+          when is_integer(ArityVal) ->
+            SuccBlk = map_get(Succ, Blocks),
+            case is_tagged_tuple_2(SuccBlk, Tuple, Fail) of
+                no ->
+                    no;
+                {yes,Tag} ->
+                    {yes,Fail,Tuple,Arity,Tag}
             end;
         _ ->
             no
@@ -752,12 +897,12 @@ is_tagged_tuple_4([], _, _) -> no.
 %%% subexpressions across instructions that clobber the X registers.
 %%%
 
-ssa_opt_cse({#st{ssa=Linear}=St, FuncDb}) ->
-    M = #{0=>#{}},
-    {St#st{ssa=cse(Linear, #{}, M)}, FuncDb}.
+ssa_opt_cse({#opt_st{ssa=Linear}=St, FuncDb}) ->
+    M = #{0 => #{}, ?EXCEPTION_BLOCK => #{}},
+    {St#opt_st{ssa=cse(Linear, #{}, M)}, FuncDb}.
 
 cse([{L,#b_blk{is=Is0,last=Last0}=Blk}|Bs], Sub0, M0) ->
-    Es0 = maps:get(L, M0),
+    Es0 = map_get(L, M0),
     {Is1,Es,Sub} = cse_is(Is0, Es0, Sub0, []),
     Last = sub(Last0, Sub),
     M = cse_successors(Is1, Blk, Es, M0),
@@ -765,7 +910,7 @@ cse([{L,#b_blk{is=Is0,last=Last0}=Blk}|Bs], Sub0, M0) ->
     [{L,Blk#b_blk{is=Is,last=Last}}|cse(Bs, Sub, M)];
 cse([], _, _) -> [].
 
-cse_successors([#b_set{op=succeeded,args=[Src]},Bif|_], Blk, EsSucc, M0) ->
+cse_successors([#b_set{op={succeeded,_},args=[Src]},Bif|_], Blk, EsSucc, M0) ->
     case cse_suitable(Bif) of
         true ->
             %% The previous instruction only has a valid value at the success branch.
@@ -789,21 +934,33 @@ cse_successors_1([L|Ls], Es0, M) ->
             %% since the intersection will be empty.
             cse_successors_1(Ls, Es0, M);
         #{L:=Es1} ->
-            %% Calculate the intersection of the two maps.
-            %% Both keys and values must match.
-            Es = maps:filter(fun(Key, Value) ->
-                                     case Es1 of
-                                         #{Key:=Value} -> true;
-                                         #{} -> false
-                                     end
-                             end, Es0),
+            Es = cse_intersection(Es0, Es1),
             cse_successors_1(Ls, Es0, M#{L:=Es});
         #{} ->
             cse_successors_1(Ls, Es0, M#{L=>Es0})
     end;
 cse_successors_1([], _, M) -> M.
 
-cse_is([#b_set{op=succeeded,dst=Bool,args=[Src]}=I0|Is], Es, Sub0, Acc) ->
+%% Calculate the intersection of the two maps. Both keys and values
+%% must match.
+cse_intersection(M1, M2) ->
+    if
+        map_size(M1) < map_size(M2) ->
+            cse_intersection_1(maps:to_list(M1), M2, M1);
+        true ->
+            cse_intersection_1(maps:to_list(M2), M1, M2)
+    end.
+
+cse_intersection_1([{Key,Value}|KVs], M, Result) ->
+    case M of
+        #{Key := Value} ->
+            cse_intersection_1(KVs, M, Result);
+        #{} ->
+            cse_intersection_1(KVs, M, maps:remove(Key, Result))
+    end;
+cse_intersection_1([], _, Result) -> Result.
+
+cse_is([#b_set{op={succeeded,_},dst=Bool,args=[Src]}=I0|Is], Es, Sub0, Acc) ->
     I = sub(I0, Sub0),
     case I of
         #b_set{args=[Src]} ->
@@ -835,13 +992,41 @@ cse_is([#b_set{dst=Dst}=I0|Is], Es0, Sub0, Acc) ->
                             Sub = Sub0#{Dst=>Src},
                             cse_is(Is, Es0, Sub, Acc);
                         #{} ->
-                            Es = Es0#{ExprKey=>Dst},
+                            Es1 = Es0#{ExprKey=>Dst},
+                            Es = cse_add_inferred_exprs(I, Es1),
                             cse_is(Is, Es, Sub0, [I|Acc])
                     end
             end
     end;
 cse_is([], Es, Sub, Acc) ->
     {Acc,Es,Sub}.
+
+cse_add_inferred_exprs(#b_set{op=put_list,dst=List,args=[Hd,Tl]}, Es) ->
+    Es#{{get_hd,[List]} => Hd,
+        {get_tl,[List]} => Tl};
+cse_add_inferred_exprs(#b_set{op=put_tuple,dst=Tuple,args=[E1,E2|_]}, Es) ->
+    %% Adding tuple elements beyond the first two does not seem to be
+    %% worthwhile (at least not in the sample used by scripts/diffable).
+    Es#{{get_tuple_element,[Tuple,#b_literal{val=0}]} => E1,
+        {get_tuple_element,[Tuple,#b_literal{val=1}]} => E2};
+cse_add_inferred_exprs(#b_set{op={bif,element},dst=E,
+                              args=[#b_literal{val=N},Tuple]}, Es)
+  when is_integer(N) ->
+    Es#{{get_tuple_element,[Tuple,#b_literal{val=N-1}]} => E};
+cse_add_inferred_exprs(#b_set{op={bif,hd},dst=Hd,args=[List]}, Es) ->
+    Es#{{get_hd,[List]} => Hd};
+cse_add_inferred_exprs(#b_set{op={bif,tl},dst=Tl,args=[List]}, Es) ->
+    Es#{{get_tl,[List]} => Tl};
+cse_add_inferred_exprs(#b_set{op={bif,map_get},dst=Value,args=[Key,Map]}, Es) ->
+    Es#{{get_map_element,[Map,Key]} => Value};
+cse_add_inferred_exprs(#b_set{op=put_map,dst=Map,args=Args}, Es) ->
+    cse_add_map_get(Args, Map, Es);
+cse_add_inferred_exprs(_, Es) -> Es.
+
+cse_add_map_get([Key,Value|T], Map, Es0) ->
+    Es = Es0#{{get_map_element,[Map,Key]} => Value},
+    cse_add_map_get(T, Map, Es);
+cse_add_map_get([], _, Es) -> Es.
 
 cse_expr(#b_set{op=Op,args=Args}=I) ->
     case cse_suitable(I) of
@@ -852,7 +1037,10 @@ cse_expr(#b_set{op=Op,args=Args}=I) ->
 cse_suitable(#b_set{op=get_hd}) -> true;
 cse_suitable(#b_set{op=get_tl}) -> true;
 cse_suitable(#b_set{op=put_list}) -> true;
+cse_suitable(#b_set{op=get_tuple_element}) -> true;
 cse_suitable(#b_set{op=put_tuple}) -> true;
+cse_suitable(#b_set{op=get_map_element}) -> true;
+cse_suitable(#b_set{op=put_map}) -> true;
 cse_suitable(#b_set{op={bif,tuple_size}}) ->
     %% Doing CSE for tuple_size/1 can prevent the
     %% creation of test_arity and select_tuple_arity
@@ -883,72 +1071,71 @@ cse_suitable(#b_set{}) -> false.
 %%% them in guards would require a new version of the 'fconv'
 %%% instruction that would take a failure label.  Since it is unlikely
 %%% that using float instructions in guards would be benefical, why
-%%% bother implementing a new instruction?  Also, implementing float
-%%% instructions in guards in HiPE could turn out to be a lot of work.
+%%% bother implementing a new instruction?
 %%%
 
 -record(fs,
-        {s=undefined :: 'undefined' | 'cleared',
-         regs=#{} :: #{beam_ssa:b_var():=beam_ssa:b_var()},
-         fail=none :: 'none' | beam_ssa:label(),
+        {regs=#{} :: #{beam_ssa:b_var():=beam_ssa:b_var()},
          non_guards :: gb_sets:set(beam_ssa:label()),
          bs :: beam_ssa:block_map()
         }).
 
-ssa_opt_float({#st{ssa=Linear0,cnt=Count0}=St, FuncDb}) ->
-    NonGuards0 = float_non_guards(Linear0),
-    NonGuards = gb_sets:from_list(NonGuards0),
+ssa_opt_float({#opt_st{ssa=Linear0,cnt=Count0}=St, FuncDb}) ->
+    NonGuards = non_guards(Linear0),
     Blocks = maps:from_list(Linear0),
     Fs = #fs{non_guards=NonGuards,bs=Blocks},
     {Linear,Count} = float_opt(Linear0, Count0, Fs),
-    {St#st{ssa=Linear,cnt=Count}, FuncDb}.
+    {St#opt_st{ssa=Linear,cnt=Count}, FuncDb}.
 
-float_non_guards([{L,#b_blk{is=Is}}|Bs]) ->
-    case Is of
-        [#b_set{op=landingpad}|_] ->
-            [L|float_non_guards(Bs)];
-        _ ->
-            float_non_guards(Bs)
-    end;
-float_non_guards([]) -> [?BADARG_BLOCK].
+%% The fconv instruction doesn't support jumping to a fail label, so we have to
+%% skip this optimization if the fail block is a guard.
+%%
+%% We also skip the optimization in blocks that always fail, as it's both
+%% difficult and pointless to rewrite them to use float ops.
+float_can_optimize_blk(#b_blk{last=#b_br{bool=#b_var{},fail=F}},
+                       #fs{non_guards=NonGuards}) ->
+    gb_sets:is_member(F, NonGuards);
+float_can_optimize_blk(#b_blk{}, #fs{}) ->
+    false.
 
-float_opt([{L,#b_blk{last=#b_br{fail=F}}=Blk}|Bs0],
-            Count0, #fs{non_guards=NonGuards}=Fs) ->
-    case gb_sets:is_member(F, NonGuards) of
+float_opt([{L,Blk}|Bs0], Count0, Fs) ->
+    case float_can_optimize_blk(Blk, Fs) of
         true ->
-            %% This block is not inside a guard.
-            %% We can do the optimization.
             float_opt_1(L, Blk, Bs0, Count0, Fs);
         false ->
-            %% This block is inside a guard. Don't do
-            %% any floating point optimizations.
             {Bs,Count} = float_opt(Bs0, Count0, Fs),
             {[{L,Blk}|Bs],Count}
     end;
-float_opt([{L,Blk}|Bs], Count, Fs) ->
-    float_opt_1(L, Blk, Bs, Count, Fs);
 float_opt([], Count, _Fs) ->
     {[],Count}.
 
 float_opt_1(L, #b_blk{is=Is0}=Blk0, Bs0, Count0, Fs0) ->
     case float_opt_is(Is0, Fs0, Count0, []) of
         {Is1,Fs1,Count1} ->
-            Fs2 = float_fail_label(Blk0, Fs1),
-            Fail = Fs2#fs.fail,
-            {Flush,Blk,Fs,Count2} = float_maybe_flush(Blk0, Fs2, Count1),
-            Split = float_split_conv(Is1, Blk),
-            {Blks0,Count3} = float_number(Split, L, Count2),
-            {Blks,Count4} = float_conv(Blks0, Fail, Count3),
-            {Bs,Count} = float_opt(Bs0, Count4, Fs),
+            {Flush,Blk,Fs,Count2} = float_maybe_flush(Blk0, Fs1, Count1),
+            {Blks,Count3} = float_fixup_conv(L, Is1, Blk, Count2),
+            {Bs,Count} = float_opt(Bs0, Count3, Fs),
             {Blks++Flush++Bs,Count};
         none ->
             {Bs,Count} = float_opt(Bs0, Count0, Fs0),
             {[{L,Blk0}|Bs],Count}
     end.
 
+%% Split out {float,convert} instructions into separate blocks, number
+%% the blocks, and add {succeded,body} in each {float,convert} block.
+float_fixup_conv(L, Is, Blk, Count0) ->
+    Split = float_split_conv(Is, Blk),
+    {Blks,Count} = float_number(Split, L, Count0),
+    #b_blk{last=#b_br{bool=#b_var{},fail=Fail}} = Blk,
+    float_conv(Blks, Fail, Count).
+
 %% Split {float,convert} instructions into individual blocks.
 float_split_conv(Is0, Blk) ->
     Br = #b_br{bool=#b_literal{val=true},succ=0,fail=0},
+
+    %% Note that there may be other instructions such as
+    %% remove_message before the floating point instructions;
+    %% therefore, it is essential that we don't reorder instructions.
     case splitwith(fun(#b_set{op=Op}) ->
                            Op =/= {float,convert}
                    end, Is0) of
@@ -961,90 +1148,86 @@ float_split_conv(Is0, Blk) ->
             [#b_blk{is=[Conv],last=Br}|float_split_conv(Is1, Blk)]
     end.
 
-%% Number the blocks that were split.
-float_number([B|Bs0], FirstL, Count0) ->
-    {Bs,Count} = float_number(Bs0, Count0),
-    {[{FirstL,B}|Bs],Count}.
+%% Number and chain the blocks that were split.
+float_number(Bs0, FirstL, Count0) ->
+    {[{_,FirstBlk}|Bs],Count} = float_number(Bs0, Count0),
+    {[{FirstL,FirstBlk}|Bs],Count}.
 
+float_number([B], Count) ->
+    {[{Count,B}],Count};
 float_number([B|Bs0], Count0) ->
-    {Bs,Count} = float_number(Bs0, Count0+1),
-    {[{Count0,B}|Bs],Count};
-float_number([], Count) ->
-    {[],Count}.
+    Next = Count0 + 1,
+    {Bs,Count} = float_number(Bs0, Next),
+    Br = #b_br{bool=#b_literal{val=true},succ=Next,fail=Next},
+    {[{Count0,B#b_blk{last=Br}}|Bs],Count}.
 
 %% Insert 'succeeded' instructions after each {float,convert}
 %% instruction.
-float_conv([{L,#b_blk{is=Is0}=Blk0}|Bs0], Fail, Count0) ->
+float_conv([{L,#b_blk{is=Is0,last=Last}=Blk0}|Bs0], Fail, Count0) ->
     case Is0 of
         [#b_set{op={float,convert}}=Conv] ->
-            {Bool0,Count1} = new_reg('@ssa_bool', Count0),
-            Bool = #b_var{name=Bool0},
-            Succeeded = #b_set{op=succeeded,dst=Bool,
+            {Bool,Count1} = new_var('@ssa_bool', Count0),
+            Succeeded = #b_set{op={succeeded,body},dst=Bool,
                                args=[Conv#b_set.dst]},
             Is = [Conv,Succeeded],
-            [{NextL,_}|_] = Bs0,
-            Br = #b_br{bool=Bool,succ=NextL,fail=Fail},
+            Br = Last#b_br{bool=Bool,fail=Fail},
             Blk = Blk0#b_blk{is=Is,last=Br},
             {Bs,Count} = float_conv(Bs0, Fail, Count1),
             {[{L,Blk}|Bs],Count};
         [_|_] ->
-            case Bs0 of
-                [{NextL,_}|_] ->
-                    Br = #b_br{bool=#b_literal{val=true},
-                               succ=NextL,fail=NextL},
-                    Blk = Blk0#b_blk{last=Br},
-                    {Bs,Count} = float_conv(Bs0, Fail, Count0),
-                    {[{L,Blk}|Bs],Count};
-                [] ->
-                    {[{L,Blk0}],Count0}
-            end
-    end.
+            {Bs,Count} = float_conv(Bs0, Fail, Count0),
+            {[{L,Blk0}|Bs],Count}
+    end;
+float_conv([], _, Count) ->
+    {[],Count}.
 
-float_maybe_flush(Blk0, #fs{s=cleared,fail=Fail,bs=Blocks}=Fs0, Count0) ->
+float_maybe_flush(Blk0, Fs0, Count0) ->
     #b_blk{last=#b_br{bool=#b_var{},succ=Succ}=Br} = Blk0,
-    #b_blk{is=Is} = maps:get(Succ, Blocks),
-    case Is of
-        [#b_set{anno=#{float_op:=_}}|_] ->
-            %% The next operation is also a floating point operation.
+
+    %% If the success block has an optimizable floating point instruction,
+    %% it is safe to defer flushing.
+    case float_safe_to_skip_flush(Succ, Fs0) of
+        true ->
             %% No flush needed.
             {[],Blk0,Fs0,Count0};
-        _ ->
-            %% Flush needed.
-            {Bool0,Count1} = new_reg('@ssa_bool', Count0),
-            Bool = #b_var{name=Bool0},
-
-            %% Allocate block numbers.
-            CheckL = Count1,              %For checkerror.
-            FlushL = Count1 + 1,          %For flushing of float regs.
-            Count = Count1 + 2,
-            Blk = Blk0#b_blk{last=Br#b_br{succ=CheckL}},
-
-            %% Build the block with the checkerror instruction.
-            CheckIs = [#b_set{op={float,checkerror},dst=Bool}],
-            CheckBr = #b_br{bool=Bool,succ=FlushL,fail=Fail},
-            CheckBlk = #b_blk{is=CheckIs,last=CheckBr},
+        false ->
+            %% Flush needed. Allocate block numbers.
+            FlushL = Count0,              %For flushing of float regs.
+            Count = Count0 + 1,
+            Blk = Blk0#b_blk{last=Br#b_br{succ=FlushL}},
 
             %% Build the block that flushes all registers.
             FlushIs = float_flush_regs(Fs0),
             FlushBr = #b_br{bool=#b_literal{val=true},succ=Succ,fail=Succ},
             FlushBlk = #b_blk{is=FlushIs,last=FlushBr},
 
-            %% Update state and blocks.
-            Fs = Fs0#fs{s=undefined,regs=#{},fail=none},
-            FlushBs = [{CheckL,CheckBlk},{FlushL,FlushBlk}],
+            %% Update state record and blocks.
+            Fs = Fs0#fs{regs=#{}},
+            FlushBs = [{FlushL,FlushBlk}],
             {FlushBs,Blk,Fs,Count}
-    end;
-float_maybe_flush(Blk, Fs, Count) ->
-    {[],Blk,Fs,Count}.
+    end.
 
-float_opt_is([#b_set{op=succeeded,args=[Src]}=I0],
+float_safe_to_skip_flush(L, #fs{bs=Blocks}=Fs) ->
+    #b_blk{is=Is} = Blk = map_get(L, Blocks),
+    float_can_optimize_blk(Blk, Fs) andalso float_optimizable_is(Is).
+
+float_optimizable_is([#b_set{anno=#{float_op:=_}}|_]) ->
+    true;
+float_optimizable_is([#b_set{op=get_tuple_element}|Is]) ->
+    %% The tuple sinking optimization can sink get_tuple_element instruction
+    %% into a sequence of floating point operations.
+    float_optimizable_is(Is);
+float_optimizable_is(_) ->
+    false.
+
+float_opt_is([#b_set{op={succeeded,_},args=[Src]}=I0],
              #fs{regs=Rs}=Fs, Count, Acc) ->
     case Rs of
         #{Src:=Fr} ->
             I = I0#b_set{args=[Fr]},
             {reverse(Acc, [I]),Fs,Count};
         #{} ->
-            {reverse(Acc, [I0]),Fs,Count}
+            none
     end;
 float_opt_is([#b_set{anno=Anno0}=I0|Is0], Fs0, Count0, Acc) ->
     case Anno0 of
@@ -1054,44 +1237,35 @@ float_opt_is([#b_set{anno=Anno0}=I0|Is0], Fs0, Count0, Acc) ->
             {Is,Fs,Count} = float_make_op(I1, FTypes, Fs0, Count0),
             float_opt_is(Is0, Fs, Count, reverse(Is, Acc));
         #{} ->
-            float_opt_is(Is0, Fs0#fs{regs=#{}}, Count0, [I0|Acc])
+            float_opt_is(Is0, Fs0, Count0, [I0|Acc])
     end;
-float_opt_is([], Fs, _Count, _Acc) ->
-    #fs{s=undefined} = Fs,                      %Assertion.
+float_opt_is([], _Fs, _Count, _Acc) ->
     none.
 
-float_make_op(#b_set{op={bif,Op},dst=Dst,args=As0}=I0,
-              Ts, #fs{s=S,regs=Rs0}=Fs, Count0) ->
-    {As1,Rs1,Count1} = float_load(As0, Ts, Rs0, Count0, []),
+float_make_op(#b_set{op={bif,Op},dst=Dst,args=As0,anno=Anno}=I0,
+              Ts, #fs{regs=Rs0}=Fs, Count0) ->
+    {As1,Rs1,Count1} = float_load(As0, Ts, Anno, Rs0, Count0, []),
     {As,Is0} = unzip(As1),
-    {Fr,Count2} = new_reg('@fr', Count1),
-    FrDst = #b_var{name=Fr},
+    {FrDst,Count2} = new_var('@fr', Count1),
     I = I0#b_set{op={float,Op},dst=FrDst,args=As},
     Rs = Rs1#{Dst=>FrDst},
     Is = append(Is0) ++ [I],
-    case S of
-        undefined ->
-            {Ignore,Count} = new_reg('@ssa_ignore', Count2),
-            C = #b_set{op={float,clearerror},dst=#b_var{name=Ignore}},
-            {[C|Is],Fs#fs{s=cleared,regs=Rs},Count};
-        cleared ->
-            {Is,Fs#fs{regs=Rs},Count2}
-    end.
+    {Is,Fs#fs{regs=Rs},Count2}.
 
-float_load([A|As], [T|Ts], Rs0, Count0, Acc) ->
-    {Load,Rs,Count} = float_reg_arg(A, T, Rs0, Count0),
-    float_load(As, Ts, Rs, Count, [Load|Acc]);
-float_load([], [], Rs, Count, Acc) ->
+float_load([A|As], [T|Ts], Anno, Rs0, Count0, Acc) ->
+    {Load,Rs,Count} = float_reg_arg(A, T, Anno, Rs0, Count0),
+    float_load(As, Ts, Anno, Rs, Count, [Load|Acc]);
+float_load([], [], _Anno, Rs, Count, Acc) ->
     {reverse(Acc),Rs,Count}.
 
-float_reg_arg(A, T, Rs, Count0) ->
+float_reg_arg(A, T, Anno, Rs, Count0) ->
     case Rs of
         #{A:=Fr} ->
             {{Fr,[]},Rs,Count0};
         #{} ->
-            {Fr,Count} = new_float_copy_reg(Count0),
-            Dst = #b_var{name=Fr},
-            I = float_load_reg(T, A, Dst),
+            {Dst,Count} = new_var('@fr_copy', Count0),
+            I0 = float_load_reg(T, A, Dst),
+            I = I0#b_set{anno=Anno},
             {{Dst,[I]},Rs#{A=>Dst},Count}
     end.
 
@@ -1109,21 +1283,6 @@ float_load_reg(convert, #b_literal{val=Val}=Src, Dst) ->
 float_load_reg(float, Src, Dst) ->
     #b_set{op={float,put},dst=Dst,args=[Src]}.
 
-new_float_copy_reg(Count) ->
-    new_reg('@fr_copy', Count).
-
-new_reg(Base, Count) ->
-    Fr = {Base,Count},
-    {Fr,Count+1}.
-
-float_fail_label(#b_blk{last=Last}, Fs) ->
-    case Last of
-        #b_br{bool=#b_var{},fail=Fail} ->
-            Fs#fs{fail=Fail};
-        _ ->
-            Fs
-    end.
-
 float_flush_regs(#fs{regs=Rs}) ->
     maps:fold(fun(_, #b_var{name={'@fr_copy',_}}, Acc) ->
                       Acc;
@@ -1139,35 +1298,37 @@ float_flush_regs(#fs{regs=Rs}) ->
 %%% with a cheaper instructions
 %%%
 
-ssa_opt_live({#st{ssa=Linear0}=St, FuncDb}) ->
+ssa_opt_live({#opt_st{ssa=Linear0}=St, FuncDb}) ->
     RevLinear = reverse(Linear0),
     Blocks0 = maps:from_list(RevLinear),
     Blocks = live_opt(RevLinear, #{}, Blocks0),
     Linear = beam_ssa:linearize(Blocks),
-    {St#st{ssa=Linear}, FuncDb}.
+    {St#opt_st{ssa=Linear}, FuncDb}.
 
 live_opt([{L,Blk0}|Bs], LiveMap0, Blocks) ->
     Blk1 = beam_ssa_share:block(Blk0, Blocks),
     Successors = beam_ssa:successors(Blk1),
-    Live0 = live_opt_succ(Successors, L, LiveMap0),
+    Live0 = live_opt_succ(Successors, L, LiveMap0, sets:new([{version, 2}])),
     {Blk,Live} = live_opt_blk(Blk1, Live0),
     LiveMap = live_opt_phis(Blk#b_blk.is, L, Live, LiveMap0),
     live_opt(Bs, LiveMap, Blocks#{L:=Blk});
 live_opt([], _, Acc) -> Acc.
 
-live_opt_succ([S|Ss], L, LiveMap) ->
-    Live0 = live_opt_succ(Ss, L, LiveMap),
-    Key = {S,L},
+live_opt_succ([S|Ss], L, LiveMap, Live0) ->
     case LiveMap of
-        #{Key:=Live} ->
-            gb_sets:union(Live, Live0);
+        #{{S,L}:=Live} ->
+            %% The successor has a phi node, and the value for
+            %% this block in the phi node is a variable.
+            live_opt_succ(Ss, L, LiveMap, sets:union(Live0, Live));
         #{S:=Live} ->
-            gb_sets:union(Live, Live0);
+            %% No phi node in the successor, or the value for
+            %% this block in the phi node is a literal.
+            live_opt_succ(Ss, L, LiveMap, sets:union(Live0, Live));
         #{} ->
-            Live0
+            %% A peek_message block which has not been processed yet.
+            live_opt_succ(Ss, L, LiveMap, Live0)
     end;
-live_opt_succ([], _, _) ->
-    gb_sets:empty().
+live_opt_succ([], _, _, Acc) -> Acc.
 
 live_opt_phis(Is, L, Live0, LiveMap0) ->
     LiveMap = LiveMap0#{L=>Live0},
@@ -1180,7 +1341,7 @@ live_opt_phis(Is, L, Live0, LiveMap0) ->
             case [{P,V} || {#b_var{}=V,P} <- PhiArgs] of
                 [_|_]=PhiVars ->
                     PhiLive0 = rel2fam(PhiVars),
-                    PhiLive = [{{L,P},gb_sets:union(gb_sets:from_list(Vs), Live0)} ||
+                    PhiLive = [{{L,P},list_set_union(Vs, Live0)} ||
                                   {P,Vs} <- PhiLive0],
                     maps:merge(LiveMap, maps:from_list(PhiLive));
                 [] ->
@@ -1190,62 +1351,257 @@ live_opt_phis(Is, L, Live0, LiveMap0) ->
     end.
 
 live_opt_blk(#b_blk{is=Is0,last=Last}=Blk, Live0) ->
-    Live1 = gb_sets:union(Live0, gb_sets:from_ordset(beam_ssa:used(Last))),
+    Live1 = list_set_union(beam_ssa:used(Last), Live0),
     {Is,Live} = live_opt_is(reverse(Is0), Live1, []),
     {Blk#b_blk{is=Is},Live}.
 
-live_opt_is([#b_set{op=phi,dst=Dst}=I|Is], Live, Acc) ->
-    case gb_sets:is_member(Dst, Live) of
+live_opt_is([#b_set{op=phi,dst=Dst}=I|Is], Live0, Acc) ->
+    Live = sets:del_element(Dst, Live0),
+    case sets:is_element(Dst, Live0) of
         true ->
             live_opt_is(Is, Live, [I|Acc]);
         false ->
             live_opt_is(Is, Live, Acc)
     end;
-live_opt_is([#b_set{op=succeeded,dst=SuccDst=SuccDstVar,
-                    args=[Dst]}=SuccI,
-             #b_set{dst=Dst}=I|Is], Live0, Acc) ->
-    case gb_sets:is_member(Dst, Live0) of
-        true ->
-            Live1 = gb_sets:add(Dst, Live0),
-            Live = gb_sets:delete_any(SuccDst, Live1),
-            live_opt_is([I|Is], Live, [SuccI|Acc]);
-        false ->
-            case live_opt_unused(I) of
-                {replace,NewI0} ->
-                    NewI = NewI0#b_set{dst=SuccDstVar},
-                    live_opt_is([NewI|Is], Live0, Acc);
-                keep ->
-                    case gb_sets:is_member(SuccDst, Live0) of
-                        true ->
-                            Live1 = gb_sets:add(Dst, Live0),
-                            Live = gb_sets:delete_any(SuccDst, Live1),
-                            live_opt_is([I|Is], Live, [SuccI|Acc]);
-                        false ->
-                            live_opt_is([I|Is], Live0, Acc)
-                    end
-            end
+live_opt_is([#b_set{op={succeeded,guard},dst=SuccDst,args=[Dst]}=SuccI,
+             #b_set{op=Op,dst=Dst}=I0|Is],
+            Live0, Acc) ->
+    case {sets:is_element(SuccDst, Live0),
+          sets:is_element(Dst, Live0)} of
+        {true, true} ->
+            Live = sets:del_element(SuccDst, Live0),
+            live_opt_is([I0|Is], Live, [SuccI|Acc]);
+        {true, false} ->
+            %% The result of the instruction before {succeeded,guard} is
+            %% unused. Attempt to perform a strength reduction.
+            case Op of
+                {bif,'not'} ->
+                    I = I0#b_set{op={bif,is_boolean},dst=SuccDst},
+                    live_opt_is([I|Is], Live0, Acc);
+                {bif,tuple_size} ->
+                    I = I0#b_set{op={bif,is_tuple},dst=SuccDst},
+                    live_opt_is([I|Is], Live0, Acc);
+                bs_start_match ->
+                    [#b_literal{val=new},Bin] = I0#b_set.args,
+                    I = I0#b_set{op={bif,is_bitstring},args=[Bin],dst=SuccDst},
+                    live_opt_is([I|Is], Live0, Acc);
+                get_map_element ->
+                    I = I0#b_set{op=has_map_field,dst=SuccDst},
+                    live_opt_is([I|Is], Live0, Acc);
+                _ ->
+                    Live1 = sets:del_element(SuccDst, Live0),
+                    Live = sets:add_element(Dst, Live1),
+                    live_opt_is([I0|Is], Live, [SuccI|Acc])
+            end;
+        {false, true} ->
+            live_opt_is([I0|Is], Live0, Acc);
+        {false, false} ->
+            live_opt_is(Is, Live0, Acc)
     end;
 live_opt_is([#b_set{dst=Dst}=I|Is], Live0, Acc) ->
-    case gb_sets:is_member(Dst, Live0) of
+    case sets:is_element(Dst, Live0) of
         true ->
-            Live1 = gb_sets:union(Live0, gb_sets:from_ordset(beam_ssa:used(I))),
-            Live = gb_sets:delete_any(Dst, Live1),
+            Live1 = list_set_union(beam_ssa:used(I), Live0),
+            Live = sets:del_element(Dst, Live1),
             live_opt_is(Is, Live, [I|Acc]);
         false ->
             case beam_ssa:no_side_effect(I) of
                 true ->
                     live_opt_is(Is, Live0, Acc);
                 false ->
-                    Live = gb_sets:union(Live0, gb_sets:from_ordset(beam_ssa:used(I))),
+                    Live = list_set_union(beam_ssa:used(I), Live0),
                     live_opt_is(Is, Live, [I|Acc])
             end
     end;
 live_opt_is([], Live, Acc) ->
     {Acc,Live}.
 
-live_opt_unused(#b_set{op=get_map_element}=Set) ->
-    {replace,Set#b_set{op=has_map_field}};
-live_opt_unused(_) -> keep.
+%%%
+%%% try/catch optimization.
+%%%
+%%% Attemps to rewrite try/catches as guards when we know the exception won't
+%%% be inspected in any way, and removes try/catches whose expressions will
+%%% never throw.
+%%%
+
+ssa_opt_try({#opt_st{ssa=Linear0}=St, FuncDb}) ->
+    RevLinear = reduce_try(Linear0, []),
+
+    EmptySet = sets:new([{version, 2}]),
+    Linear = trim_try(RevLinear, EmptySet, EmptySet, []),
+
+    {St#opt_st{ssa=Linear}, FuncDb}.
+
+%% Does a strength reduction of try/catch and catch.
+%%
+%% In try/catch constructs where the expression is restricted
+%% (essentially a guard expression) and the error reason is ignored
+%% in the catch part, such as:
+%%
+%%   try
+%%      <RestrictedExpression>
+%%   catch
+%%      _:_ ->
+%%        ...
+%%   end
+%%
+%% the try/catch can be eliminated by simply removing the `new_try_tag`,
+%% `landingpad`, and `kill_try_tag` instructions.
+reduce_try([{L,#b_blk{is=[#b_set{op=new_try_tag}],
+                      last=Last}=Blk0} | Bs0], Acc) ->
+    #b_br{succ=Succ,fail=Fail} = Last,
+    Ws = sets:from_list([Succ,Fail], [{version, 2}]),
+    try do_reduce_try(Bs0, Ws) of
+        Bs ->
+            Blk = Blk0#b_blk{is=[],
+                             last=#b_br{bool=#b_literal{val=true},
+                                        succ=Succ,fail=Succ}},
+            reduce_try(Bs, [{L, Blk} | Acc])
+    catch
+        throw:not_possible ->
+            reduce_try(Bs0, [{L, Blk0} | Acc])
+    end;
+reduce_try([{L, Blk} | Bs], Acc) ->
+    reduce_try(Bs, [{L, Blk} | Acc]);
+reduce_try([], Acc) ->
+    Acc.
+
+do_reduce_try([{L, Blk} | Bs]=Bs0, Ws0) ->
+    case sets:is_element(L, Ws0) of
+        false ->
+            %% This block is not reachable from the block with the
+            %% `new_try_tag` instruction. Retain it. There is no
+            %% need to check it for safety.
+            case sets:is_empty(Ws0) of
+                true -> Bs0;
+                false -> [{L, Blk} | do_reduce_try(Bs, Ws0)]
+            end;
+        true ->
+            Ws1 = sets:del_element(L, Ws0),
+            #b_blk{is=Is0} = Blk,
+            case reduce_try_is(Is0, []) of
+                {safe,Is} ->
+                    %% This block does not execute any instructions
+                    %% that would require a try. Analyze successors.
+                    Successors = beam_ssa:successors(Blk),
+                    Ws = list_set_union(Successors, Ws1),
+                    [{L, Blk#b_blk{is=Is}} | do_reduce_try(Bs, Ws)];
+                unsafe ->
+                    %% There is something unsafe in the block, for
+                    %% example a `call` instruction or an `extract`
+                    %% instruction.
+                    throw(not_possible);
+                {done,Is} ->
+                    %% This block kills the try tag (either after successful
+                    %% execution or at the landing pad). Don't analyze
+                    %% successors.
+                    [{L, Blk#b_blk{is=Is}} | do_reduce_try(Bs, Ws1)]
+            end
+    end;
+do_reduce_try([], Ws) ->
+    true = sets:is_empty(Ws),                   %Assertion.
+    [].
+
+reduce_try_is([#b_set{op=kill_try_tag}|Is], Acc) ->
+    %% Remove this kill_try_tag instruction. If there was a landingpad
+    %% instruction in this block, it has already been removed. Preserve
+    %% all other instructions in the block.
+    {done,reverse(Acc, Is)};
+reduce_try_is([#b_set{op=extract}|_], _Acc) ->
+    %% The error reason is accessed.
+    unsafe;
+reduce_try_is([#b_set{op=landingpad}|Is], Acc) ->
+    reduce_try_is(Is, Acc);
+reduce_try_is([#b_set{op={succeeded,body}}=I0|Is], Acc) ->
+    %% If we reached this point, it means that the previous instruction
+    %% has no side effects. We must now convert the flavor of the
+    %% succeeded to the `guard`, since the try/catch will be removed.
+    I = I0#b_set{op={succeeded,guard}},
+    reduce_try_is(Is, [I|Acc]);
+reduce_try_is([#b_set{op=Op}=I|Is], Acc) ->
+    IsSafe = case Op of
+                 phi -> true;
+                 _ -> beam_ssa:no_side_effect(I)
+             end,
+    case IsSafe of
+        true -> reduce_try_is(Is, [I|Acc]);
+        false -> unsafe
+    end;
+reduce_try_is([], Acc) ->
+    {safe,reverse(Acc)}.
+
+%% Removes try/catch expressions whose expressions will never throw.
+%%
+%% We walk backwards through all blocks, maintaining a set of potentially
+%% unreachable landing pads, removing them from the set whenever we see a
+%% branch to that block. When we encounter a `new_try_tag` instruction that
+%% references a block in the unreachable set, we'll remove the try/catch.
+trim_try([{L, #b_blk{is=[#b_set{op=landingpad} | _]}=Blk}| Bs],
+         Unreachable0, Killed, Acc) ->
+    Unreachable1 = sets:add_element(L, Unreachable0),
+    Successors = sets:from_list(beam_ssa:successors(Blk)),
+    Unreachable = sets:subtract(Unreachable1, Successors),
+    trim_try(Bs, Unreachable, Killed, [{L, Blk} | Acc]);
+trim_try([{L, #b_blk{last=#b_ret{}}=Blk} | Bs], Unreachable, Killed, Acc) ->
+    %% Nothing to update and nothing to optimize.
+    trim_try(Bs, Unreachable, Killed, [{L,Blk}|Acc]);
+trim_try([{L, Blk0} | Bs], Unreachable0, Killed0, Acc) ->
+    case sets:is_empty(Unreachable0) of
+        true ->
+            %% Nothing to update and nothing to optimize.
+            trim_try(Bs, Unreachable0, Killed0, [{L,Blk0}|Acc]);
+        false ->
+            #b_blk{is=Is0,last=Last0} = Blk0,
+            case reverse(Is0) of
+                [#b_set{op=new_try_tag,dst=Tag}|Is] ->
+                    #b_br{succ=SuccLbl,fail=PadLbl} = Last0,
+                    Unreachable = sets:del_element(PadLbl, Unreachable0),
+                    case sets:is_element(PadLbl, Unreachable0) of
+                        true ->
+                            %% The landing pad can't be reached in any way,
+                            %% remove the entire try/catch.
+                            Blk = Blk0#b_blk{is=reverse(Is),
+                                             last=#b_br{bool=#b_literal{val=true},
+                                                        succ=SuccLbl,fail=SuccLbl}},
+                            Killed = sets:add_element(Tag, Killed0),
+                            trim_try(Bs, Unreachable, Killed, [{L,Blk}|Acc]);
+                        false ->
+                            trim_try(Bs, Unreachable, Killed0, [{L,Blk0}|Acc])
+                    end;
+                _ ->
+                    %% Update the set of unreachable landing_pad blocks.
+                    Successors = sets:from_list(beam_ssa:successors(Blk0)),
+                    Unreachable = sets:subtract(Unreachable0, Successors),
+                    trim_try(Bs, Unreachable, Killed0, [{L,Blk0}|Acc])
+            end
+    end;
+trim_try([], _Unreachable, Killed, Acc0) ->
+    case sets:is_empty(Killed) of
+        true ->
+            Acc0;
+        false ->
+            %% Remove all `kill_try_tag` instructions referencing removed
+            %% try/catches.
+            [{L, Blk#b_blk{is=trim_try_is(Is0, Killed)}} ||
+                {L, #b_blk{is=Is0}=Blk} <- Acc0]
+    end.
+
+trim_try_is([#b_set{op=phi,dst=CatchEndVal}=Phi,
+             #b_set{op=catch_end,dst=Dst,args=[Tag,CatchEndVal]}=Catch | Is],
+            Killed) ->
+    case sets:is_element(Tag, Killed) of
+        true -> [Phi#b_set{dst=Dst} | trim_try_is(Is, Killed)];
+        false -> [Phi, Catch | trim_try_is(Is, Killed)]
+    end;
+trim_try_is([#b_set{op=kill_try_tag,args=[Tag]}=I | Is], Killed) ->
+    case sets:is_element(Tag, Killed) of
+        true -> trim_try_is(Is, Killed);
+        false -> [I | trim_try_is(Is, Killed)]
+    end;
+trim_try_is([I | Is], Killed) ->
+    [I | trim_try_is(Is, Killed)];
+trim_try_is([], _Killed) ->
+    [].
 
 %%%
 %%% Optimize binary matching.
@@ -1257,10 +1613,10 @@ live_opt_unused(_) -> keep.
 %%%   with bs_test_tail.
 %%%
 
-ssa_opt_bsm({#st{ssa=Linear}=St, FuncDb}) ->
+ssa_opt_bsm({#opt_st{ssa=Linear}=St, FuncDb}) ->
     Extracted0 = bsm_extracted(Linear),
-    Extracted = cerl_sets:from_list(Extracted0),
-    {St#st{ssa=bsm_skip(Linear, Extracted)}, FuncDb}.
+    Extracted = sets:from_list(Extracted0, [{version, 2}]),
+    {St#opt_st{ssa=bsm_skip(Linear, Extracted)}, FuncDb}.
 
 bsm_skip([{L,#b_blk{is=Is0}=Blk}|Bs0], Extracted) ->
     Bs = bsm_skip(Bs0, Extracted),
@@ -1273,8 +1629,10 @@ bsm_skip_is([I0|Is], Extracted) ->
         #b_set{op=bs_match,
                dst=Ctx,
                args=[#b_literal{val=T}=Type,PrevCtx|Args0]}
-          when T =/= string, T =/= skip ->
-            I = case cerl_sets:is_element(Ctx, Extracted) of
+          when T =/= float, T =/= string, T =/= skip ->
+            %% Note that it is never safe to skip matching
+            %% of floats, even if the size is known to be correct.
+            I = case sets:is_element(Ctx, Extracted) of
                     true ->
                         I0;
                     false ->
@@ -1320,7 +1678,7 @@ coalesce_skips_is([#b_set{op=bs_match,
                                 Ctx0,Type,Flags,
                                 #b_literal{val=Size0},
                                 #b_literal{val=Unit0}]}=Skip0,
-                   #b_set{op=succeeded}],
+                   #b_set{op={succeeded,guard}}],
                   #b_br{succ=L2,fail=Fail}=Br0,
                   Bs0) when is_integer(Size0) ->
     case Bs0 of
@@ -1329,7 +1687,7 @@ coalesce_skips_is([#b_set{op=bs_match,
                                args=[#b_literal{val=skip},_,_,_,
                                      #b_literal{val=Size1},
                                      #b_literal{val=Unit1}]},
-                        #b_set{op=succeeded}=Succeeded],
+                        #b_set{op={succeeded,guard}}=Succeeded],
                     last=#b_br{fail=Fail}=Br}}|Bs] when is_integer(Size1) ->
             SkipBits = Size0 * Unit0 + Size1 * Unit1,
             Skip = Skip0#b_set{dst=SkipDst,
@@ -1358,14 +1716,14 @@ coalesce_skips_is(_, _, _) ->
 %%% Short-cutting binary matching instructions.
 %%%
 
-ssa_opt_bsm_shortcut({#st{ssa=Linear}=St, FuncDb}) ->
+ssa_opt_bsm_shortcut({#opt_st{ssa=Linear}=St, FuncDb}) ->
     Positions = bsm_positions(Linear, #{}),
     case map_size(Positions) of
         0 ->
             %% No binary matching instructions.
             {St, FuncDb};
         _ ->
-            {St#st{ssa=bsm_shortcut(Linear, Positions)}, FuncDb}
+            {St#opt_st{ssa=bsm_shortcut(Linear, Positions)}, FuncDb}
     end.
 
 bsm_positions([{L,#b_blk{is=Is,last=Last}}|Bs], PosMap0) ->
@@ -1373,7 +1731,7 @@ bsm_positions([{L,#b_blk{is=Is,last=Last}}|Bs], PosMap0) ->
     case {Is,Last} of
         {[#b_set{op=bs_test_tail,dst=Bool,args=[Ctx,#b_literal{val=Bits0}]}],
          #b_br{bool=Bool,fail=Fail}} ->
-            Bits = Bits0 + maps:get(Ctx, PosMap0),
+            Bits = Bits0 + map_get(Ctx, PosMap0),
             bsm_positions(Bs, PosMap#{L=>{Bits,Fail}});
         {_,_} ->
             bsm_positions(Bs, PosMap)
@@ -1409,7 +1767,7 @@ bsm_update_bits(_, Bits) -> Bits.
 bsm_shortcut([{L,#b_blk{is=Is,last=Last0}=Blk}|Bs], PosMap) ->
     case {Is,Last0} of
         {[#b_set{op=bs_match,dst=New,args=[_,Old|_]},
-          #b_set{op=succeeded,dst=Bool,args=[New]}],
+          #b_set{op={succeeded,guard},dst=Bool,args=[New]}],
          #b_br{bool=Bool,fail=Fail}} ->
             case PosMap of
                 #{Old:=Bits,Fail:={TailBits,NextFail}} when Bits > TailBits ->
@@ -1424,110 +1782,6 @@ bsm_shortcut([{L,#b_blk{is=Is,last=Last0}=Blk}|Bs], PosMap) ->
 bsm_shortcut([], _PosMap) -> [].
 
 %%%
-%%% Eliminate redundant bs_test_unit2 instructions.
-%%%
-
-ssa_opt_bsm_units({#st{ssa=Linear}=St, FuncDb}) ->
-    {St#st{ssa=bsm_units(Linear, #{})}, FuncDb}.
-
-bsm_units([{L,#b_blk{last=#b_br{succ=Succ,fail=Fail}}=Block0} | Bs], UnitMaps0) ->
-    UnitsIn = maps:get(L, UnitMaps0, #{}),
-    {Block, UnitsOut} = bsm_units_skip(Block0, UnitsIn),
-    UnitMaps1 = bsm_units_join(Succ, UnitsOut, UnitMaps0),
-    UnitMaps = bsm_units_join(Fail, UnitsIn, UnitMaps1),
-    [{L, Block} | bsm_units(Bs, UnitMaps)];
-bsm_units([{L,#b_blk{last=#b_switch{fail=Fail,list=Switch}}=Block} | Bs], UnitMaps0) ->
-    UnitsIn = maps:get(L, UnitMaps0, #{}),
-    Labels = [Fail | [Lbl || {_Arg, Lbl} <- Switch]],
-    UnitMaps = foldl(fun(Lbl, UnitMaps) ->
-                             bsm_units_join(Lbl, UnitsIn, UnitMaps)
-                     end, UnitMaps0, Labels),
-    [{L, Block} | bsm_units(Bs, UnitMaps)];
-bsm_units([{L, Block} | Bs], UnitMaps) ->
-    [{L, Block} | bsm_units(Bs, UnitMaps)];
-bsm_units([], _UnitMaps) ->
-    [].
-
-bsm_units_skip(Block, Units) ->
-    bsm_units_skip_1(Block#b_blk.is, Block, Units).
-
-bsm_units_skip_1([#b_set{op=bs_start_match,dst=New}|_], Block, Units) ->
-    %% We bail early since there can't be more than one match per block.
-    {Block, Units#{ New => 1 }};
-bsm_units_skip_1([#b_set{op=bs_match,
-                         dst=New,
-                         args=[#b_literal{val=skip},
-                               Ctx,
-                               #b_literal{val=binary},
-                               _Flags,
-                               #b_literal{val=all},
-                               #b_literal{val=OpUnit}]}=Skip | Test],
-                 Block0, Units) ->
-    [#b_set{op=succeeded,dst=Bool,args=[New]}] = Test, %Assertion.
-    #b_br{bool=Bool} = Last0 = Block0#b_blk.last, %Assertion.
-    CtxUnit = maps:get(Ctx, Units),
-    if
-        CtxUnit rem OpUnit =:= 0 ->
-            Is = takewhile(fun(I) -> I =/= Skip end, Block0#b_blk.is),
-            Last = Last0#b_br{bool=#b_literal{val=true}},
-            Block = Block0#b_blk{is=Is,last=Last},
-            {Block, Units#{ New => CtxUnit }};
-        CtxUnit rem OpUnit =/= 0 ->
-            {Block0, Units#{ New => OpUnit, Ctx => OpUnit }}
-    end;
-bsm_units_skip_1([#b_set{op=bs_match,dst=New,args=Args}|_], Block, Units) ->
-    [_,Ctx|_] = Args,
-    CtxUnit = maps:get(Ctx, Units),
-    OpUnit = bsm_op_unit(Args),
-    {Block, Units#{ New => gcd(OpUnit, CtxUnit) }};
-bsm_units_skip_1([_I | Is], Block, Units) ->
-    bsm_units_skip_1(Is, Block, Units);
-bsm_units_skip_1([], Block, Units) ->
-    {Block, Units}.
-
-bsm_op_unit([_,_,_,Size,#b_literal{val=U}]) ->
-    case Size of
-        #b_literal{val=Sz} when is_integer(Sz) -> Sz*U;
-        _ -> U
-    end;
-bsm_op_unit([#b_literal{val=string},_,#b_literal{val=String}]) ->
-    bit_size(String);
-bsm_op_unit([#b_literal{val=utf8}|_]) ->
-    8;
-bsm_op_unit([#b_literal{val=utf16}|_]) ->
-    16;
-bsm_op_unit([#b_literal{val=utf32}|_]) ->
-    32;
-bsm_op_unit(_) ->
-    1.
-
-%% Several paths can lead to the same match instruction and the inferred units
-%% may differ between them, so we can only keep the information that is common
-%% to all paths.
-bsm_units_join(Lbl, MapA, UnitMaps0) when is_map_key(Lbl, UnitMaps0) ->
-    MapB = maps:get(Lbl, UnitMaps0),
-    Merged = if
-                 map_size(MapB) =< map_size(MapA) ->
-                     bsm_units_join_1(maps:keys(MapB), MapA, MapB);
-                 map_size(MapB) > map_size(MapA) ->
-                     bsm_units_join_1(maps:keys(MapA), MapB, MapA)
-             end,
-    maps:put(Lbl, Merged, UnitMaps0);
-bsm_units_join(Lbl, MapA, UnitMaps0) when MapA =/= #{} ->
-    maps:put(Lbl, MapA, UnitMaps0);
-bsm_units_join(_Lbl, _MapA, UnitMaps0) ->
-    UnitMaps0.
-
-bsm_units_join_1([Key | Keys], Left, Right) when is_map_key(Key, Left) ->
-    UnitA = maps:get(Key, Left),
-    UnitB = maps:get(Key, Right),
-    bsm_units_join_1(Keys, Left, maps:put(Key, gcd(UnitA, UnitB), Right));
-bsm_units_join_1([Key | Keys], Left, Right) ->
-    bsm_units_join_1(Keys, Left, maps:remove(Key, Right));
-bsm_units_join_1([], _MapA, Right) ->
-    Right.
-
-%%%
 %%% Optimize binary construction.
 %%%
 %%% If an integer segment or a float segment has a literal size and
@@ -1536,14 +1790,14 @@ bsm_units_join_1([], _MapA, Right) ->
 %%% to bs_put_string instructions in later pass.
 %%%
 
-ssa_opt_bs_puts({#st{ssa=Linear0,cnt=Count0}=St, FuncDb}) ->
+ssa_opt_bs_puts({#opt_st{ssa=Linear0,cnt=Count0}=St, FuncDb}) ->
     {Linear,Count} = opt_bs_puts(Linear0, Count0, []),
-    {St#st{ssa=Linear,cnt=Count}, FuncDb}.
+    {St#opt_st{ssa=Linear,cnt=Count}, FuncDb}.
 
 opt_bs_puts([{L,#b_blk{is=Is}=Blk0}|Bs], Count0, Acc0) ->
     case Is of
-        [#b_set{op=bs_put}=I0] ->
-            case opt_bs_put(L, I0, Blk0, Count0, Acc0) of
+        [#b_set{op=bs_put},#b_set{op={succeeded,_}}]=Is ->
+            case opt_bs_put(L, Is, Blk0, Count0, Acc0) of
                 not_possible ->
                     opt_bs_puts(Bs, Count0, [{L,Blk0}|Acc0]);
                 {Count,Acc1} ->
@@ -1563,41 +1817,50 @@ opt_bs_puts_merge([{L1,#b_blk{is=Is}=Blk0},{L2,#b_blk{is=AccIs}}=BAcc|Acc]) ->
                        #b_literal{},
                        #b_literal{val=Bin0},
                        #b_literal{val=all},
-                       #b_literal{val=1}]}],
+                       #b_literal{val=1}]},
+          #b_set{op={succeeded,_}}],
          [#b_set{op=bs_put,
                  args=[#b_literal{val=binary},
                        #b_literal{},
                        #b_literal{val=Bin1},
                        #b_literal{val=all},
-                       #b_literal{val=1}]}=I0]} ->
+                       #b_literal{val=1}]}=I0,
+          #b_set{op={succeeded,_}}=Succeeded]} ->
             %% Coalesce the two segments to one.
             Bin = <<Bin0/bitstring,Bin1/bitstring>>,
             I = I0#b_set{args=bs_put_args(binary, Bin, all)},
-            Blk = Blk0#b_blk{is=[I]},
+            Blk = Blk0#b_blk{is=[I,Succeeded]},
             [{L2,Blk}|Acc];
         {_,_} ->
             [{L1,Blk0},BAcc|Acc]
     end.
 
-opt_bs_put(L, I0, #b_blk{last=Br0}=Blk0, Count0, Acc) ->
+opt_bs_put(L, [I0,Succeeded], #b_blk{last=Br0}=Blk0, Count0, Acc) ->
     case opt_bs_put(I0) of
         [Bin] when is_bitstring(Bin) ->
             Args = bs_put_args(binary, Bin, all),
             I = I0#b_set{args=Args},
-            Blk = Blk0#b_blk{is=[I]},
+            Blk = Blk0#b_blk{is=[I,Succeeded]},
             {Count0,[{L,Blk}|Acc]};
         [{int,Int,Size},Bin] when is_bitstring(Bin) ->
             %% Construct a bs_put_integer instruction following
             %% by a bs_put_binary instruction.
             IntArgs = bs_put_args(integer, Int, Size),
             BinArgs = bs_put_args(binary, Bin, all),
-            {BinL,BinVarNum} = {Count0,Count0+1},
-            Count = Count0 + 2,
-            BinVar = #b_var{name={'@ssa_bool',BinVarNum}},
+
+            {BinL,BinVarNum,BinBoolNum} = {Count0,Count0+1,Count0+2},
+            Count = Count0 + 3,
+            BinVar = #b_var{name={'@ssa_bs_put',BinVarNum}},
+            BinBool = #b_var{name={'@ssa_bool',BinBoolNum}},
+
             BinI = I0#b_set{dst=BinVar,args=BinArgs},
-            BinBlk = Blk0#b_blk{is=[BinI],last=Br0#b_br{bool=BinVar}},
+            BinSucceeded = Succeeded#b_set{dst=BinBool,args=[BinVar]},
+            BinBlk = Blk0#b_blk{is=[BinI,BinSucceeded],
+                                last=Br0#b_br{bool=BinBool}},
+
             IntI = I0#b_set{args=IntArgs},
-            IntBlk = Blk0#b_blk{is=[IntI],last=Br0#b_br{succ=BinL}},
+            IntBlk = Blk0#b_blk{is=[IntI,Succeeded],last=Br0#b_br{succ=BinL}},
+
             {Count,[{BinL,BinBlk},{L,IntBlk}|Acc]};
         not_possible ->
             not_possible
@@ -1634,8 +1897,13 @@ opt_bs_put(#b_set{args=[#b_literal{val=Type},#b_literal{val=Flags},
                     I = I0#b_set{args=Args},
                     opt_bs_put(I);
                 {binary,_} when is_bitstring(Val) ->
-                    <<Bitstring:EffectiveSize/bits,_/bits>> = Val,
-                    [Bitstring];
+                    case Val of
+                        <<Bitstring:EffectiveSize/bits,_/bits>> ->
+                            [Bitstring];
+                        _ ->
+                            %% Specified size exceeds size of bitstring.
+                            not_possible
+                    end;
                 {float,Endian} ->
                     try
                         [opt_bs_put_float(Val, EffectiveSize, Endian)]
@@ -1706,7 +1974,7 @@ opt_bs_put_split_int_1(Int, L, R) ->
 %%%   .
 %%%   .
 %%%   Size = bif:tuple_size Var
-%%%   BoolVar1 = succeeded Size
+%%%   BoolVar1 = succeeded:guard Size
 %%%   br BoolVar1, label 4, label 3
 %%%
 %%% 4:
@@ -1756,36 +2024,45 @@ opt_bs_put_split_int_1(Int, L, R) ->
 %%% is_tuple_of_arity instruction by the loader.
 %%%
 
-ssa_opt_tuple_size({#st{ssa=Linear0,cnt=Count0}=St, FuncDb}) ->
-    {Linear,Count} = opt_tup_size(Linear0, Count0, []),
-    {St#st{ssa=Linear,cnt=Count}, FuncDb}.
+ssa_opt_tuple_size({#opt_st{ssa=Linear0,cnt=Count0}=St, FuncDb}) ->
+    %% This optimization is only safe in guards, as prefixing tuple_size with
+    %% an is_tuple check prevents it from throwing an exception.
+    NonGuards = non_guards(Linear0),
+    {Linear,Count} = opt_tup_size(Linear0, NonGuards, Count0, []),
+    {St#opt_st{ssa=Linear,cnt=Count}, FuncDb}.
 
-opt_tup_size([{L,#b_blk{is=Is,last=Last}=Blk}|Bs], Count0, Acc0) ->
+opt_tup_size([{L,#b_blk{is=Is,last=Last}=Blk}|Bs], NonGuards, Count0, Acc0) ->
     case {Is,Last} of
         {[#b_set{op={bif,'=:='},dst=Bool,args=[#b_var{}=Tup,#b_literal{val=Arity}]}],
          #b_br{bool=Bool}} when is_integer(Arity), Arity >= 0 ->
-            {Acc,Count} = opt_tup_size_1(Tup, L, Count0, Acc0),
-            opt_tup_size(Bs, Count, [{L,Blk}|Acc]);
+            {Acc,Count} = opt_tup_size_1(Tup, L, NonGuards, Count0, Acc0),
+            opt_tup_size(Bs, NonGuards, Count, [{L,Blk}|Acc]);
         {_,_} ->
-            opt_tup_size(Bs, Count0, [{L,Blk}|Acc0])
+            opt_tup_size(Bs, NonGuards, Count0, [{L,Blk}|Acc0])
     end;
-opt_tup_size([], Count, Acc) ->
+opt_tup_size([], _NonGuards, Count, Acc) ->
     {reverse(Acc),Count}.
 
-opt_tup_size_1(Size, EqL, Count0, [{L,Blk0}|Acc]) ->
-    case Blk0 of
-        #b_blk{is=Is0,last=#b_br{bool=Bool,succ=EqL,fail=Fail}} ->
-            case opt_tup_size_is(Is0, Bool, Size, []) of
-                none ->
+opt_tup_size_1(Size, EqL, NonGuards, Count0, [{L,Blk0}|Acc]) ->
+    #b_blk{is=Is0,last=Last} = Blk0,
+    case Last of
+        #b_br{bool=Bool,succ=EqL,fail=Fail} ->
+            case gb_sets:is_member(Fail, NonGuards) of
+                true ->
                     {[{L,Blk0}|Acc],Count0};
-                {PreIs,TupleSizeIs,Tuple} ->
-                    opt_tup_size_2(PreIs, TupleSizeIs, L, EqL,
-                                   Tuple, Fail, Count0, Acc)
+                false ->
+                    case opt_tup_size_is(Is0, Bool, Size, []) of
+                        none ->
+                            {[{L,Blk0}|Acc],Count0};
+                        {PreIs,TupleSizeIs,Tuple} ->
+                            opt_tup_size_2(PreIs, TupleSizeIs, L, EqL,
+                                           Tuple, Fail, Count0, Acc)
+                    end
             end;
-        #b_blk{} ->
+        _ ->
             {[{L,Blk0}|Acc],Count0}
     end;
-opt_tup_size_1(_, _, Count, Acc) ->
+opt_tup_size_1(_, _, _, Count, Acc) ->
     {Acc,Count}.
 
 opt_tup_size_2(PreIs, TupleSizeIs, PreL, EqL, Tuple, Fail, Count0, Acc) ->
@@ -1809,7 +2086,7 @@ opt_tup_size_2(PreIs, TupleSizeIs, PreL, EqL, Tuple, Fail, Count0, Acc) ->
       {PreL,PreBlk}|Acc],Count}.
 
 opt_tup_size_is([#b_set{op={bif,tuple_size},dst=Size,args=[Tuple]}=I,
-                 #b_set{op=succeeded,dst=Bool,args=[Size]}],
+                 #b_set{op={succeeded,_},dst=Bool,args=[Size]}],
                 Bool, Size, Acc) ->
     {reverse(Acc),[I],Tuple};
 opt_tup_size_is([I|Is], Bool, Size, Acc) ->
@@ -1819,168 +2096,107 @@ opt_tup_size_is([], _, _, _Acc) -> none.
 %%%
 %%% Optimize #b_switch{} instructions.
 %%%
-%%% If the argument for a #b_switch{} comes from a phi node with all
-%%% literals, any values in the switch list which are not in the phi
-%%% node can be removed.
-%%%
-%%% If the values in the phi node and switch list are the same,
-%%% the failure label can't be reached and be eliminated.
-%%%
 %%% A #b_switch{} with only one value can be rewritten to
 %%% a #b_br{}. A switch that only verifies that the argument
-%%% is 'true' or 'false' can be rewritten to a is_boolean test.
-%%%
+%%% is 'true' or 'false' can be rewritten to an is_boolean test.
+%%%b
 
-ssa_opt_sw({#st{ssa=Linear0,cnt=Count0}=St, FuncDb}) ->
-    {Linear,Count} = opt_sw(Linear0, #{}, Count0, []),
-    {St#st{ssa=Linear,cnt=Count}, FuncDb}.
+ssa_opt_sw({#opt_st{ssa=Linear0,cnt=Count0}=St, FuncDb}) ->
+    {Linear,Count} = opt_sw(Linear0, Count0, []),
+    {St#opt_st{ssa=Linear,cnt=Count}, FuncDb}.
 
-opt_sw([{L,#b_blk{is=Is,last=#b_switch{}=Last0}=Blk0}|Bs], Phis0, Count0, Acc) ->
-    Phis = opt_sw_phis(Is, Phis0),
-    case opt_sw_last(Last0, Phis) of
+opt_sw([{L,#b_blk{is=Is,last=#b_switch{}=Sw0}=Blk0}|Bs], Count0, Acc) ->
+    case Sw0 of
         #b_switch{arg=Arg,fail=Fail,list=[{Lit,Lbl}]} ->
             %% Rewrite a single value switch to a br.
-            Bool = #b_var{name={'@ssa_bool',Count0}},
-            Count = Count0 + 1,
+            {Bool,Count} = new_var('@ssa_bool', Count0),
             IsEq = #b_set{op={bif,'=:='},dst=Bool,args=[Arg,Lit]},
             Br = #b_br{bool=Bool,succ=Lbl,fail=Fail},
             Blk = Blk0#b_blk{is=Is++[IsEq],last=Br},
-            opt_sw(Bs, Phis, Count, [{L,Blk}|Acc]);
+            opt_sw(Bs, Count, [{L,Blk}|Acc]);
         #b_switch{arg=Arg,fail=Fail,
                   list=[{#b_literal{val=B1},Lbl},{#b_literal{val=B2},Lbl}]}
           when B1 =:= not B2 ->
             %% Replace with is_boolean test.
-            Bool = #b_var{name={'@ssa_bool',Count0}},
-            Count = Count0 + 1,
+            {Bool,Count} = new_var('@ssa_bool', Count0),
             IsBool = #b_set{op={bif,is_boolean},dst=Bool,args=[Arg]},
             Br = #b_br{bool=Bool,succ=Lbl,fail=Fail},
             Blk = Blk0#b_blk{is=Is++[IsBool],last=Br},
-            opt_sw(Bs, Phis, Count, [{L,Blk}|Acc]);
-        Last0 ->
-            opt_sw(Bs, Phis, Count0, [{L,Blk0}|Acc]);
-        Last ->
-            Blk = Blk0#b_blk{last=Last},
-            opt_sw(Bs, Phis, Count0, [{L,Blk}|Acc])
+            opt_sw(Bs, Count, [{L,Blk}|Acc]);
+        _ ->
+            opt_sw(Bs, Count0, [{L,Blk0}|Acc])
     end;
-opt_sw([{L,#b_blk{is=Is}=Blk}|Bs], Phis0, Count, Acc) ->
-    Phis = opt_sw_phis(Is, Phis0),
-    opt_sw(Bs, Phis, Count, [{L,Blk}|Acc]);
-opt_sw([], _Phis, Count, Acc) ->
+opt_sw([{L,#b_blk{}=Blk}|Bs], Count, Acc) ->
+    opt_sw(Bs, Count, [{L,Blk}|Acc]);
+opt_sw([], Count, Acc) ->
     {reverse(Acc),Count}.
 
-opt_sw_phis([#b_set{op=phi,dst=Dst,args=Args}|Is], Phis) ->
-    case opt_sw_literals(Args, []) of
-        error ->
-            opt_sw_phis(Is, Phis);
-        Literals ->
-            opt_sw_phis(Is, Phis#{Dst=>Literals})
+%%% Try to replace `=/=` with `=:=` and `/=` with `==`. For example,
+%%% this code:
+%%%
+%%%    Bool = bif:'=/=' Anything, AnyValue
+%%%    br Bool, ^Succ, ^Fail
+%%%
+%%% can be rewritten like this:
+%%%
+%%%    Bool = bif:'=:=' Anything, AnyValue
+%%%    br Bool, ^Fail, ^Succ
+%%%
+%%% The transformation is only safe if the only used of Bool is in the
+%%% terminator. We therefore need to verify that there is only one
+%%% use.
+%%%
+%%% This transformation is not an optimization in itself, but it opens
+%%% up for other optimizations in beam_ssa_type and beam_ssa_dead.
+%%%
+
+ssa_opt_ne({#opt_st{ssa=Linear0}=St, FuncDb}) ->
+    Linear = opt_ne(Linear0, {uses,Linear0}),
+    {St#opt_st{ssa=Linear}, FuncDb}.
+
+opt_ne([{L,#b_blk{is=[_|_]=Is0,last=#b_br{bool=#b_var{}=Bool}}=Blk0}|Bs], Uses0) ->
+    case last(Is0) of
+        #b_set{op={bif,'=/='},dst=Bool}=I0 ->
+            I = I0#b_set{op={bif,'=:='}},
+            {Blk,Uses} = opt_ne_replace(I, Blk0, Uses0),
+            [{L,Blk}|opt_ne(Bs, Uses)];
+        #b_set{op={bif,'/='},dst=Bool}=I0 ->
+            I = I0#b_set{op={bif,'=='}},
+            {Blk,Uses} = opt_ne_replace(I, Blk0, Uses0),
+            [{L,Blk}|opt_ne(Bs, Uses)];
+        _ ->
+            [{L,Blk0}|opt_ne(Bs, Uses0)]
     end;
-opt_sw_phis(_, Phis) -> Phis.
+opt_ne([{L,Blk}|Bs], Uses) ->
+    [{L,Blk}|opt_ne(Bs, Uses)];
+opt_ne([], _Uses) -> [].
 
-opt_sw_last(#b_switch{arg=Arg,fail=Fail,list=List0}=Sw0, Phis) ->
-    case Phis of
-        #{Arg:=Values0} ->
-            Values = gb_sets:from_list(Values0),
-
-            %% Prune the switch list to only contain the possible values.
-            List1 = [P || {Lit,_}=P <- List0, gb_sets:is_member(Lit, Values)],
-
-            %% Now test whether the failure label can ever be reached.
-            Sw = case gb_sets:size(Values) =:= length(List1) of
-                     true ->
-                         %% The switch list has the same number of values as the phi node.
-                         %% The values must be the same, because the values that were not
-                         %% possible were pruned from the switch list. Therefore, the
-                         %% failure label can't possibly be reached, and we can choose a
-                         %% a new failure label by picking a value from the list.
-                         case List1 of
-                             [{#b_literal{},Lbl}|List] ->
-                                 Sw0#b_switch{fail=Lbl,list=List};
-                             [] ->
-                                 Sw0#b_switch{list=List1}
-                         end;
-                     false ->
-                         %% There are some values in the phi node that are not in the
-                         %% switch list; thus, the failure label can still be reached.
-                         Sw0
-                 end,
-            beam_ssa:normalize(Sw);
-        #{} ->
-            %% Ensure that no label in the switch list is the same
-            %% as the failure label.
-            List = [{Val,Lbl} || {Val,Lbl} <- List0, Lbl =/= Fail],
-            Sw = Sw0#b_switch{list=List},
-            beam_ssa:normalize(Sw)
+opt_ne_replace(#b_set{dst=Bool}=I,
+               #b_blk{is=Is0,last=#b_br{succ=Succ,fail=Fail}=Br0}=Blk,
+               Uses0) ->
+    case opt_ne_single_use(Bool, Uses0) of
+        {true,Uses} ->
+            Is = replace_last(Is0, I),
+            Br = Br0#b_br{succ=Fail,fail=Succ},
+            {Blk#b_blk{is=Is,last=Br},Uses};
+        {false,Uses} ->
+            %% The variable is used more than once. Not safe.
+            {Blk,Uses}
     end.
 
-opt_sw_literals([{#b_literal{}=Lit,_}|T], Acc) ->
-    opt_sw_literals(T, [Lit|Acc]);
-opt_sw_literals([_|_], _Acc) ->
-    error;
-opt_sw_literals([], Acc) -> Acc.
+replace_last([_], Repl) -> [Repl];
+replace_last([I|Is], Repl) -> [I|replace_last(Is, Repl)].
 
-
-%%%
-%%% Merge blocks.
-%%%
-
-ssa_opt_merge_blocks({#st{ssa=Blocks}=St, FuncDb}) ->
-    Preds = beam_ssa:predecessors(Blocks),
-    Merged = merge_blocks_1(beam_ssa:rpo(Blocks), Preds, Blocks),
-    {St#st{ssa=Merged}, FuncDb}.
-
-merge_blocks_1([L|Ls], Preds0, Blocks0) ->
-    case Preds0 of
-        #{L:=[P]} ->
-            #{P:=Blk0,L:=Blk1} = Blocks0,
-            case is_merge_allowed(L, Blk0, Blk1) of
-                true ->
-                    #b_blk{is=Is0} = Blk0,
-                    #b_blk{is=Is1} = Blk1,
-                    verify_merge_is(Is1),
-                    Is = Is0 ++ Is1,
-                    Blk = Blk1#b_blk{is=Is},
-                    Blocks1 = maps:remove(L, Blocks0),
-                    Blocks2 = maps:put(P, Blk, Blocks1),
-                    Successors = beam_ssa:successors(Blk),
-                    Blocks = beam_ssa:update_phi_labels(Successors, L, P, Blocks2),
-                    Preds = merge_update_preds(Successors, L, P, Preds0),
-                    merge_blocks_1(Ls, Preds, Blocks);
-                false ->
-                    merge_blocks_1(Ls, Preds0, Blocks0)
-            end;
-        #{} ->
-            merge_blocks_1(Ls, Preds0, Blocks0)
-    end;
-merge_blocks_1([], _Preds, Blocks) -> Blocks.
-
-merge_update_preds([L|Ls], From, To, Preds0) ->
-    Ps = [rename_label(P, From, To) || P <- maps:get(L, Preds0)],
-    Preds = maps:put(L, Ps, Preds0),
-    merge_update_preds(Ls, From, To, Preds);
-merge_update_preds([], _, _, Preds) -> Preds.
-
-rename_label(From, From, To) -> To;
-rename_label(Lbl, _, _) -> Lbl.
-
-verify_merge_is([#b_set{op=Op}|_]) ->
-    %% The merged block has only one predecessor, so it should not have any phi
-    %% nodes.
-    true = Op =/= phi;                          %Assertion.
-verify_merge_is(_) ->
-    ok.
-
-is_merge_allowed(_, #b_blk{}, #b_blk{is=[#b_set{op=peek_message}|_]}) ->
-    false;
-is_merge_allowed(L, #b_blk{last=#b_br{}}=Blk, #b_blk{}) ->
-    %% The predecessor block must have exactly one successor (L) for
-    %% the merge to be safe.
-    case beam_ssa:successors(Blk) of
-        [L] -> true;
-        [_|_] -> false
-    end;
-is_merge_allowed(_, #b_blk{last=#b_switch{}}, #b_blk{}) ->
-    false.
+opt_ne_single_use(Var, {uses,Linear}) ->
+    Blocks = maps:from_list(Linear),
+    RPO = beam_ssa:rpo(Blocks),
+    Uses = beam_ssa:uses(RPO, Blocks),
+    opt_ne_single_use(Var, Uses);
+opt_ne_single_use(Var, Uses) when is_map(Uses) ->
+    {case Uses of
+         #{Var:=[_]} -> true;
+         #{Var:=[_|_]} -> false
+     end,Uses}.
 
 %%%
 %%% When a tuple is matched, the pattern matching compiler generates a
@@ -1997,56 +2213,106 @@ is_merge_allowed(_, #b_blk{last=#b_switch{}}, #b_blk{}) ->
 %%% extracting tuple elements on execution paths that never use the
 %%% extracted values.
 %%%
+%%% However, there is one caveat to be aware of. Sinking tuple elements
+%%% will keep the entire tuple alive longer. In rare circumstance, that
+%%% can be a problem. Here is an example:
+%%%
+%%%    mapfoldl(F, Acc0, [Hd|Tail]) ->
+%%%        {R,Acc1} = F(Hd, Acc0),
+%%%        {Rs,Acc2} = mapfoldl(F, Acc1, Tail),
+%%%        {[R|Rs],Acc2};
+%%%    mapfoldl(F, Acc, []) ->
+%%%        {[],Acc}.
+%%%
+%%% Sinking get_tuple_element instructions will generate code similar
+%%% to this example:
+%%%
+%%%    slow_mapfoldl(F, Acc0, [Hd|Tail]) ->
+%%%        Res1 = F(Hd, Acc0),
+%%%        Res2 = slow_mapfoldl(F, element(2, Res1), Tail),
+%%%        {[element(1, Res1)|element(1, Res2)],element(2, Res2)};
+%%%    slow_mapfoldl(F, Acc, []) ->
+%%%        {[],Acc}.
+%%%
+%%% Here the entire tuple bound to `Res1` will be kept alive until
+%%% `slow_mapfoldl/3` returns. That is, every intermediate accumulator
+%%% will be kept alive.
+%%%
+%%% In this case, not sinking is clearly superior:
+%%%
+%%%    fast_mapfoldl(F, Acc0, [Hd|Tail]) ->
+%%%        Res1 = F(Hd, Acc0),
+%%%        R = element(1, Res1),
+%%%        Res2 = fast_mapfoldl(F, element(2, Res1), Tail),
+%%%        {[R|element(1, Res2)],element(2, Res2)};
+%%%    fast_mapfoldl(F, Acc, []) ->
+%%%        {[],Acc}.
+%%%
+%%% The `slow_mapfoldl/3` and `fast_mapfoldl/3` use the same number of
+%%% stack slots.
+%%%
+%%% To avoid producing code similar to `slow_mapfoldl/3`, use an
+%%% heuristic to only sink when sinking would reduce the number of
+%%% stack slots, or if there can't possibly be a recursive call
+%%% involved. This is a heuristic because it is difficult to exactly
+%%% predict the number of stack slots that will be needed for a given
+%%% piece of code.
 
-ssa_opt_sink({#st{ssa=Blocks0}=St, FuncDb}) ->
-    Linear = beam_ssa:linearize(Blocks0),
-
+ssa_opt_sink({#opt_st{ssa=Linear}=St, FuncDb}) ->
     %% Create a map with all variables that define get_tuple_element
-    %% instructions. The variable name map to the block it is defined in.
-    Defs = maps:from_list(def_blocks(Linear)),
+    %% instructions. The variable name maps to the block it is defined
+    %% in and the source tuple.
+    case def_blocks(Linear) of
+        [] ->
+            %% No get_tuple_element instructions, so there is nothing to do.
+            {St, FuncDb};
+        [_|_]=Defs0 ->
+            Defs = maps:from_list(Defs0),
+            {do_ssa_opt_sink(Defs, St), FuncDb}
+    end.
 
-    %% Now find all the blocks that use variables defined by get_tuple_element
-    %% instructions.
+do_ssa_opt_sink(Defs, #opt_st{ssa=Linear}=St) ->
+    %% Find all the blocks that use variables defined by
+    %% get_tuple_element instructions.
     Used = used_blocks(Linear, Defs, []),
 
     %% Calculate dominators.
-    Dom0 = beam_ssa:dominators(Blocks0),
+    Blocks0 = maps:from_list(Linear),
+    RPO = beam_ssa:rpo(Blocks0),
+    Preds = beam_ssa:predecessors(Blocks0),
+    {Dom, Numbering} = beam_ssa:dominators_from_predecessors(RPO, Preds),
 
     %% It is not safe to move get_tuple_element instructions to blocks
     %% that begin with certain instructions. It is also unsafe to move
-    %% the instructions into any part of a receive. To avoid such
-    %% unsafe moves, pretend that the unsuitable blocks are not
-    %% dominators.
+    %% the instructions into any part of a receive.
     Unsuitable = unsuitable(Linear, Blocks0),
-    Dom = case gb_sets:is_empty(Unsuitable) of
-              true ->
-                  Dom0;
-              false ->
-                  F = fun(_, DomBy) ->
-                              [L || L <- DomBy,
-                                    not gb_sets:is_element(L, Unsuitable)]
-                      end,
-                  maps:map(F, Dom0)
-          end,
 
     %% Calculate new positions for get_tuple_element instructions. The new
     %% position is a block that dominates all uses of the variable.
-    DefLoc = new_def_locations(Used, Defs, Dom),
+    DefLocs0 = new_def_locations(Used, Defs, Dom, Numbering, Unsuitable),
+
+    %% Avoid keeping tuples alive if only one element is accessed later and
+    %% if there is the chance of a recursive call being made. This is an
+    %% important precaution to avoid that lists:mapfoldl/3 keeps all previous
+    %% versions of the accumulator alive until the end of the input list.
+    Ps = partition_deflocs(DefLocs0, Defs, Blocks0),
+    DefLocs1 = filter_deflocs(Ps, Preds, Blocks0),
+    DefLocs = sort(DefLocs1),
 
     %% Now move all suitable get_tuple_element instructions to their
     %% new blocks.
-    Blocks = foldl(fun({V,To}, A) ->
-                           From = maps:get(V, Defs),
+    Blocks = foldl(fun({V,{From,To}}, A) ->
                            move_defs(V, From, To, A)
-                   end, Blocks0, DefLoc),
-    {St#st{ssa=Blocks}, FuncDb}.
+                   end, Blocks0, DefLocs),
+
+    St#opt_st{ssa=beam_ssa:linearize(Blocks)}.
 
 def_blocks([{L,#b_blk{is=Is}}|Bs]) ->
     def_blocks_is(Is, L, def_blocks(Bs));
 def_blocks([]) -> [].
 
-def_blocks_is([#b_set{op=get_tuple_element,dst=Dst}|Is], L, Acc) ->
-    def_blocks_is(Is, L, [{Dst,L}|Acc]);
+def_blocks_is([#b_set{op=get_tuple_element,args=[Tuple,_],dst=Dst}|Is], L, Acc) ->
+    def_blocks_is(Is, L, [{Dst,{L,Tuple}}|Acc]);
 def_blocks_is([_|Is], L, Acc) ->
     def_blocks_is(Is, L, Acc);
 def_blocks_is([], _, Acc) -> Acc.
@@ -2058,6 +2324,180 @@ used_blocks([{L,Blk}|Bs], Def, Acc0) ->
 used_blocks([], _Def, Acc) ->
     rel2fam(Acc).
 
+%% Partition sinks for get_tuple_element instructions in the same
+%% clause extracting from the same tuple. Sort each partition in
+%% execution order.
+partition_deflocs(DefLoc, _Defs, Blocks) ->
+    {BlkNums0,_} = mapfoldl(fun(L, N) -> {{L,N},N+1} end, 0, beam_ssa:rpo(Blocks)),
+    BlkNums = maps:from_list(BlkNums0),
+    S = [{Tuple,{map_get(To, BlkNums),{V,{From,To}}}} ||
+            {V,Tuple,{From,To}} <- DefLoc],
+    F = rel2fam(S),
+    partition_deflocs_1(F, Blocks).
+
+partition_deflocs_1([{Tuple,DefLocs0}|T], Blocks) ->
+    DefLocs1 = [DL || {_,DL} <- DefLocs0],
+    DefLocs = partition_dl(DefLocs1, Blocks),
+    [{Tuple,DL} || DL <- DefLocs] ++ partition_deflocs_1(T, Blocks);
+partition_deflocs_1([], _) -> [].
+
+partition_dl([_]=DefLoc, _Blocks) ->
+    [DefLoc];
+partition_dl([{_,{_,First}}|_]=DefLoc0, Blocks) ->
+    RPO = beam_ssa:rpo([First], Blocks),
+    {P,DefLoc} = partition_dl_1(DefLoc0, RPO, []),
+    [P|partition_dl(DefLoc, Blocks)];
+partition_dl([], _Blocks) -> [].
+
+partition_dl_1([{_,{_,L}}=DL|DLs], [L|_]=Ls, Acc) ->
+    partition_dl_1(DLs, Ls, [DL|Acc]);
+partition_dl_1([_|_]=DLs, [_|Ls], Acc) ->
+    partition_dl_1(DLs, Ls, Acc);
+partition_dl_1([], _, Acc) ->
+    {reverse(Acc),[]};
+partition_dl_1([_|_]=DLs, [], Acc) ->
+    {reverse(Acc),DLs}.
+
+filter_deflocs([{Tuple,DefLoc0}|DLs], Preds, Blocks) ->
+    %% Input is a list of sinks of get_tuple_element instructions in
+    %% execution order from the same tuple in the same clause.
+    [{_,{_,First}}|_] = DefLoc0,
+    Paths = find_paths_to_check(DefLoc0, First),
+    WillGC0 = ordsets:from_list([FromTo || {{_,_}=FromTo,_} <- Paths]),
+    WillGC1 = [{{From,To},will_gc(From, To, Preds, Blocks, true)} ||
+                  {From,To} <- WillGC0],
+    WillGC = maps:from_list(WillGC1),
+
+    %% Separate sinks that will force the reference to the tuple to be
+    %% saved on the stack from sinks that don't force.
+    {DefLocGC0,DefLocNoGC} =
+        partition(fun({{_,_}=FromTo,_}) ->
+                          map_get(FromTo, WillGC)
+                  end, Paths),
+
+    %% Avoid potentially harmful sinks.
+    DefLocGC = filter_gc_deflocs(DefLocGC0, Tuple, First, Preds, Blocks),
+
+    %% Construct the complete list of sink operations.
+    DefLoc1 = DefLocGC ++ DefLocNoGC,
+    [DL || {_,{_,{From,To}}=DL} <- DefLoc1, From =/= To] ++
+        filter_deflocs(DLs, Preds, Blocks);
+filter_deflocs([], _, _) -> [].
+
+%% Use an heuristic to avoid harmful sinking in lists:mapfold/3 and
+%% similar functions.
+filter_gc_deflocs(DefLocGC, Tuple, First, Preds, Blocks) ->
+    case DefLocGC of
+        [] ->
+            [];
+        [{_,{_,{From,To}}}] ->
+            %% There is only one get_tuple_element instruction that
+            %% can be sunk. That means that we may not gain any slots
+            %% by sinking it.
+            case is_on_stack(First, Tuple, Blocks) of
+                true ->
+                    %% The tuple itself must be stored in a stack slot
+                    %% (because it will be used later) in addition to
+                    %% the tuple element being extracted. It is
+                    %% probably a win to sink this instruction.
+                    DefLocGC;
+                false ->
+                    case will_gc(From, To, Preds, Blocks, false) of
+                        false ->
+                            %% There is no risk for recursive calls,
+                            %% so it should be safe to
+                            %% sink. Theoretically, we shouldn't win
+                            %% any stack slots, but in practice it
+                            %% seems that sinking makes it more likely
+                            %% that the stack slot for a dying value
+                            %% can be immediately reused for another
+                            %% value.
+                            DefLocGC;
+                        true ->
+                            %% This function could be involved in a
+                            %% recursive call. Since there is no
+                            %% obvious reduction in the number of
+                            %% stack slots, we will not sink.
+                            []
+                    end
+            end;
+        [_,_|_] ->
+            %% More than one get_tuple_element instruction can be
+            %% sunk. Sinking will almost certainly reduce the number
+            %% of stack slots.
+            DefLocGC
+    end.
+
+find_paths_to_check([{_,{_,To}}=Move|T], First) ->
+    [{{First,To},Move}|find_paths_to_check(T, First)];
+find_paths_to_check([], _First) -> [].
+
+will_gc(From, To, Preds, Blocks, All) ->
+    Between = beam_ssa:between(From, To, Preds, Blocks),
+    will_gc_1(Between, To, Blocks, All, #{From => false}).
+
+will_gc_1([To|_], To, _Blocks, _All, WillGC) ->
+    map_get(To, WillGC);
+will_gc_1([L|Ls], To, Blocks, All, WillGC0) ->
+    #b_blk{is=Is} = Blk = map_get(L, Blocks),
+    GC = map_get(L, WillGC0) orelse will_gc_is(Is, All),
+    WillGC = gc_update_successors(Blk, GC, WillGC0),
+    will_gc_1(Ls, To, Blocks, All, WillGC).
+
+will_gc_is([#b_set{op=call,args=Args}|Is], false) ->
+    case Args of
+        [#b_remote{mod=#b_literal{val=erlang}}|_] ->
+            %% Assume that remote calls to the erlang module can't cause a recursive
+            %% call.
+            will_gc_is(Is, false);
+        [_|_] ->
+            true
+    end;
+will_gc_is([_|Is], false) ->
+    %% Instructions that clobber X registers may cause a GC, but will not cause
+    %% a recursive call.
+    will_gc_is(Is, false);
+will_gc_is([I|Is], All) ->
+    beam_ssa:clobbers_xregs(I) orelse will_gc_is(Is, All);
+will_gc_is([], _All) -> false.
+
+is_on_stack(From, Var, Blocks) ->
+    is_on_stack(beam_ssa:rpo([From], Blocks), Var, Blocks, #{From => false}).
+
+is_on_stack([L|Ls], Var, Blocks, WillGC0) ->
+    #b_blk{is=Is} = Blk = map_get(L, Blocks),
+    GC0 = map_get(L, WillGC0),
+    try is_on_stack_is(Is, Var, GC0) of
+        GC ->
+            WillGC = gc_update_successors(Blk, GC, WillGC0),
+            is_on_stack(Ls, Var, Blocks, WillGC)
+    catch
+        throw:{done,GC} ->
+            GC
+    end;
+is_on_stack([], _Var, _, _) -> false.
+
+is_on_stack_is([#b_set{op=get_tuple_element}|Is], Var, GC) ->
+    is_on_stack_is(Is, Var, GC);
+is_on_stack_is([I|Is], Var, GC0) ->
+    case GC0 andalso member(Var, beam_ssa:used(I)) of
+        true ->
+            throw({done,GC0});
+        false ->
+            GC = GC0 orelse beam_ssa:clobbers_xregs(I),
+            is_on_stack_is(Is, Var, GC)
+    end;
+is_on_stack_is([], _, GC) -> GC.
+
+gc_update_successors(Blk, GC, WillGC) ->
+    foldl(fun(L, Acc) ->
+                  case Acc of
+                      #{L := true} -> Acc;
+                      #{L := false} when GC =:= false -> Acc;
+                      #{} -> Acc#{L => GC}
+                  end
+          end, WillGC, beam_ssa:successors(Blk)).
+
 %% unsuitable(Linear, Blocks) -> Unsuitable.
 %%  Return an ordset of block labels for the blocks that are not
 %%  suitable for sinking of get_tuple_element instructions.
@@ -2068,15 +2508,13 @@ unsuitable(Linear, Blocks) ->
     Unsuitable1 = unsuitable_recv(Linear, Blocks, Predecessors),
     gb_sets:from_list(Unsuitable0 ++ Unsuitable1).
 
-unsuitable_1([{L,#b_blk{is=[#b_set{op=Op}|_]}}|Bs]) ->
+unsuitable_1([{L,#b_blk{is=[#b_set{op=Op}=I|_]}}|Bs]) ->
     Unsuitable = case Op of
                      bs_extract -> true;
                      bs_put -> true;
                      {float,_} -> true;
                      landingpad -> true;
-                     peek_message -> true;
-                     wait_timeout -> true;
-                     _ -> false
+                     _ -> beam_ssa:is_loop_header(I)
                  end,
     case Unsuitable of
         true ->
@@ -2106,14 +2544,14 @@ unsuitable_loop(L, Blocks, Predecessors) ->
     unsuitable_loop(L, Blocks, Predecessors, []).
 
 unsuitable_loop(L, Blocks, Predecessors, Acc) ->
-    Ps = maps:get(L, Predecessors),
+    Ps = map_get(L, Predecessors),
     unsuitable_loop_1(Ps, Blocks, Predecessors, Acc).
 
 unsuitable_loop_1([P|Ps], Blocks, Predecessors, Acc0) ->
-    case maps:get(P, Blocks) of
-        #b_blk{is=[#b_set{op=peek_message}|_]} ->
+    case is_loop_header(P, Blocks) of
+        true ->
             unsuitable_loop_1(Ps, Blocks, Predecessors, Acc0);
-        #b_blk{} ->
+        false ->
             case ordsets:is_element(P, Acc0) of
                 false ->
                     Acc1 = ordsets:add_element(P, Acc0),
@@ -2125,50 +2563,53 @@ unsuitable_loop_1([P|Ps], Blocks, Predecessors, Acc0) ->
     end;
 unsuitable_loop_1([], _, _, Acc) -> Acc.
 
-%% new_def_locations([{Variable,[UsedInBlock]}|Vs], Defs, Dominators) ->
-%%          [{Variable,NewDefinitionBlock}]
-%%  Calculate new locations for get_tuple_element instructions. For each
-%%  variable, the new location is a block that dominates all uses of
-%%  variable and as near to the uses of as possible. If no such block
-%%  distinct from the block where the instruction currently is, the
-%%  variable will not be included in the result list.
+is_loop_header(L, Blocks) ->
+    case map_get(L, Blocks) of
+        #b_blk{is=[I|_]} ->
+            beam_ssa:is_loop_header(I);
+        #b_blk{} ->
+            false
+    end.
 
-new_def_locations([{V,UsedIn}|Vs], Defs, Dom) ->
-    DefIn = maps:get(V, Defs),
-    case common_dom(UsedIn, DefIn, Dom) of
-        [] ->
-            new_def_locations(Vs, Defs, Dom);
-        [_|_]=BetterDef ->
-            L = most_dominated(BetterDef, Dom),
-            [{V,L}|new_def_locations(Vs, Defs, Dom)]
-    end;
-new_def_locations([], _, _) -> [].
+%% new_def_locations([{Variable,[UsedInBlock]}|Vs], Defs,
+%%                   Dominators, Numbering, Unsuitable) ->
+%%  [{Variable,NewDefinitionBlock}]
+%%
+%%  Calculate new locations for get_tuple_element instructions. For
+%%  each variable, the new location is a block that dominates all uses
+%%  of the variable and as near to the uses of as possible.
 
-common_dom([L|Ls], DefIn, Dom) ->
-    DomBy0 = maps:get(L, Dom),
-    DomBy = ordsets:subtract(DomBy0, maps:get(DefIn, Dom)),
-    common_dom_1(Ls, Dom, DomBy).
+new_def_locations([{V,UsedIn}|Vs], Defs, Dom, Numbering, Unsuitable) ->
+    {DefIn,Tuple} = map_get(V, Defs),
+    Common = common_dominator(UsedIn, Dom, Numbering, Unsuitable),
+    Sink = case member(Common, map_get(DefIn, Dom)) of
+               true ->
+                   %% The common dominator is either DefIn or an
+                   %% ancestor of DefIn. We'll need to consider all
+                   %% get_tuple_element instructions so we will add
+                   %% a dummy sink.
+                   {V,Tuple,{DefIn,DefIn}};
+               false ->
+                   %% We have found a suitable descendant of DefIn,
+                   %% to which the get_tuple_element instruction can
+                   %% be sunk.
+                   {V,Tuple,{DefIn,Common}}
+           end,
+    [Sink|new_def_locations(Vs, Defs, Dom, Numbering, Unsuitable)];
+new_def_locations([], _, _, _, _) -> [].
 
-common_dom_1(_, _, []) ->
-    [];
-common_dom_1([L|Ls], Dom, [_|_]=DomBy0) ->
-    DomBy1 = maps:get(L, Dom),
-    DomBy = ordsets:intersection(DomBy0, DomBy1),
-    common_dom_1(Ls, Dom, DomBy);
-common_dom_1([], _, DomBy) -> DomBy.
-
-most_dominated([L|Ls], Dom) ->
-    most_dominated(Ls, L, maps:get(L, Dom), Dom).
-
-most_dominated([L|Ls], L0, DomBy, Dom) ->
-    case member(L, DomBy) of
+common_dominator(Ls0, Dom, Numbering, Unsuitable) ->
+    [Common|_] = beam_ssa:common_dominators(Ls0, Dom, Numbering),
+    case gb_sets:is_member(Common, Unsuitable) of
         true ->
-            most_dominated(Ls, L0, DomBy, Dom);
+            %% It is not allowed to place the instruction here. Try
+            %% to find another suitable dominating block by going up
+            %% one step in the dominator tree.
+            [Common,OneUp|_] = map_get(Common, Dom),
+            common_dominator([OneUp], Dom, Numbering, Unsuitable);
         false ->
-            most_dominated(Ls, L, maps:get(L, Dom), Dom)
-    end;
-most_dominated([], L, _, _) -> L.
-
+            Common
+    end.
 
 %% Move get_tuple_element instructions to their new locations.
 
@@ -2177,7 +2618,6 @@ move_defs(V, From, To, Blocks) ->
     {Def,FromBlk} = remove_def(V, FromBlk0),
     try insert_def(V, Def, ToBlk0) of
         ToBlk ->
-            %%io:format("~p: ~p => ~p\n", [V,From,To]),
             Blocks#{From:=FromBlk,To:=ToBlk}
     catch
         throw:not_possible ->
@@ -2208,12 +2648,11 @@ insert_def_is([#b_set{op=Op}=I|Is]=Is0, V, Def) ->
     Action0 = case Op of
                   call -> beyond;
                   'catch_end' -> beyond;
-                  set_tuple_element -> beyond;
-                  timeout -> beyond;
+                  wait_timeout -> beyond;
                   _ -> here
               end,
     Action = case Is of
-                 [#b_set{op=succeeded}|_] -> here;
+                 [#b_set{op={succeeded,_}}|_] -> here;
                  _ -> Action0
              end,
     case Action of
@@ -2233,16 +2672,458 @@ insert_def_is([#b_set{op=Op}=I|Is]=Is0, V, Def) ->
 insert_def_is([], _V, Def) ->
     [Def].
 
+%%%
+%%% Order consecutive get_tuple_element instructions in ascending
+%%% position order. This will give the loader more opportunities
+%%% for combining get_tuple_element instructions.
+%%%
+
+ssa_opt_get_tuple_element({#opt_st{ssa=Blocks0}=St, FuncDb}) ->
+    Blocks = opt_get_tuple_element(maps:to_list(Blocks0), Blocks0),
+    {St#opt_st{ssa=Blocks}, FuncDb}.
+
+opt_get_tuple_element([{L,#b_blk{is=Is0}=Blk0}|Bs], Blocks) ->
+    case opt_get_tuple_element_is(Is0, false, []) of
+        {yes,Is} ->
+            Blk = Blk0#b_blk{is=Is},
+            opt_get_tuple_element(Bs, Blocks#{L:=Blk});
+        no ->
+            opt_get_tuple_element(Bs, Blocks)
+    end;
+opt_get_tuple_element([], Blocks) -> Blocks.
+
+opt_get_tuple_element_is([#b_set{op=get_tuple_element,
+                                 args=[#b_var{}=Src,_]}=I0|Is0],
+                         _AnyChange, Acc) ->
+    {GetIs0,Is} = collect_get_tuple_element(Is0, Src, [I0]),
+    GetIs1 = sort([{Pos,I} || #b_set{args=[_,Pos]}=I <- GetIs0]),
+    GetIs = [I || {_,I} <- GetIs1],
+    opt_get_tuple_element_is(Is, true, reverse(GetIs, Acc));
+opt_get_tuple_element_is([I|Is], AnyChange, Acc) ->
+    opt_get_tuple_element_is(Is, AnyChange, [I|Acc]);
+opt_get_tuple_element_is([], AnyChange, Acc) ->
+    case AnyChange of
+        true -> {yes,reverse(Acc)};
+        false -> no
+    end.
+
+collect_get_tuple_element([#b_set{op=get_tuple_element,
+                                  args=[Src,_]}=I|Is], Src, Acc) ->
+    collect_get_tuple_element(Is, Src, [I|Acc]);
+collect_get_tuple_element(Is, _Src, Acc) ->
+    {Acc,Is}.
+
+%%%
+%%% Unfold literals to avoid unnecessary move instructions in call
+%%% instructions.
+%%%
+%%% Consider the following example:
+%%%
+%%%     -module(whatever).
+%%%     -export([foo/0]).
+%%%     foo() ->
+%%%         foobar(1, 2, 3).
+%%%     foobar(A, B, C) ->
+%%%         foobar(A, B, C, []).
+%%%     foobar(A, B, C, D) -> ...
+%%%
+%%% The type optimization pass will find out that A, B, and C have constant
+%%% values and do constant folding, rewriting foobar/3 to:
+%%%
+%%%     foobar(A, B, C) ->
+%%%         foobar(1, 2, 3, []).
+%%%
+%%% That will result in three extra `move` instructions.
+%%%
+%%% This optimization sub pass will undo the constant folding
+%%% optimization, rewriting code to use the original variable instead
+%%% of the constant if the original variable is known to be in an x
+%%% register.
+%%%
+%%% This optimization sub pass will also undo constant folding of the
+%%% list of arguments in the call to error/2 in the last clause of a
+%%% function. For example:
+%%%
+%%%     bar(X, Y) ->
+%%%         error(function_clause, [X,42]).
+%%%
+%%% will be rewritten to:
+%%%
+%%%     bar(X, Y) ->
+%%%         error(function_clause, [X,Y]).
+%%%
+
+ssa_opt_unfold_literals({St,FuncDb}) ->
+    #opt_st{ssa=Blocks0,args=Args,anno=Anno,cnt=Count0} = St,
+    ParamInfo = maps:get(parameter_info, Anno, #{}),
+    LitMap = collect_arg_literals(Args, ParamInfo, 0, #{}),
+    case map_size(LitMap) of
+        0 ->
+            %% None of the arguments for this function are known
+            %% literals. Nothing to do.
+            {St,FuncDb};
+        _ ->
+            SafeMap = #{0 => true},
+            {Blocks,Count} = unfold_literals(beam_ssa:rpo(Blocks0),
+                                             LitMap, SafeMap, Count0, Blocks0),
+            {St#opt_st{ssa=Blocks,cnt=Count},FuncDb}
+    end.
+
+collect_arg_literals([V|Vs], Info, X, Acc0) ->
+    case Info of
+        #{V:=VarInfo} ->
+            Type = proplists:get_value(type, VarInfo, any),
+            case beam_types:get_singleton_value(Type) of
+                {ok,Val} ->
+                    F = fun(Vars) -> [{X,V}|Vars] end,
+                    Acc = maps:update_with(Val, F, [{X,V}], Acc0),
+                    collect_arg_literals(Vs, Info, X + 1, Acc);
+                error ->
+                    collect_arg_literals(Vs, Info, X + 1, Acc0)
+            end;
+        #{} ->
+            collect_arg_literals(Vs, Info, X + 1, Acc0)
+    end;
+collect_arg_literals([], _Info, _X, Acc) -> Acc.
+
+unfold_literals([L|Ls], LitMap, SafeMap0, Count0, Blocks0) ->
+    {Blocks,Safe,Count} =
+        case map_get(L, SafeMap0) of
+            false ->
+                %% Before reaching this block, an instruction that
+                %% clobbers x registers has been executed.  *If* we
+                %% would use an argument variable instead of literal,
+                %% it would force the value to be saved to a y
+                %% register. This is not what we want.
+                {Blocks0,false,Count0};
+            true ->
+                %% All x registers live when entering the function
+                %% are still live. Using the variable instead of
+                %% the substituted value will eliminate a `move`
+                %% instruction.
+                #b_blk{is=Is0} = Blk = map_get(L, Blocks0),
+                {Is,Safe0,Count1} = unfold_lit_is(Is0, LitMap, Count0, []),
+                {Blocks0#{L:=Blk#b_blk{is=Is}},Safe0,Count1}
+        end,
+    %% Propagate safeness to successors.
+    Successors = beam_ssa:successors(L, Blocks),
+    SafeMap = unfold_update_succ(Successors, Safe, SafeMap0),
+    unfold_literals(Ls, LitMap, SafeMap, Count,Blocks);
+unfold_literals([], _, _, Count, Blocks) ->
+    {Blocks,Count}.
+
+unfold_update_succ([S|Ss], Safe, SafeMap0) ->
+    F = fun(Prev) -> Prev and Safe end,
+    SafeMap = maps:update_with(S, F, Safe, SafeMap0),
+    unfold_update_succ(Ss, Safe, SafeMap);
+unfold_update_succ([], _, SafeMap) -> SafeMap.
+
+unfold_lit_is([#b_set{op=call,
+                      args=[#b_remote{mod=#b_literal{val=erlang},
+                                      name=#b_literal{val=error},
+                                      arity=2},
+                            #b_literal{val=function_clause},
+                            ArgumentList]}=I0|Is], LitMap, Count0, Acc0) ->
+    %% This is a call to error/2 that raises a function_clause
+    %% exception in the final clause of a function. Try to undo
+    %% constant folding in the list of arguments (the second argument
+    %% for error/2).
+    case unfold_arg_list(Acc0, ArgumentList, LitMap, Count0, 0, []) of
+        {[FinalPutList|_]=Acc,Count} ->
+            %% Acc now contains the possibly rewritten code that
+            %% creates the argument list. All that remains is to
+            %% rewrite the call to error/2 itself so that is will
+            %% refer to rewritten argument list. This is essential
+            %% when all arguments have known literal values as in this
+            %% example:
+            %%
+            %%     foo(X, Y) -> error(function_clause, [0,1]).
+            %%
+            #b_set{op=put_list,dst=ListVar} = FinalPutList,
+            #b_set{args=[ErlangError,Fc,_]} = I0,
+            I = I0#b_set{args=[ErlangError,Fc,ListVar]},
+            {reverse(Acc, [I|Is]),false,Count};
+        {[],_} ->
+            %% Handle code such as:
+            %%
+            %% bar(KnownValue, Stk) -> error(function_clause, Stk).
+            {reverse(Acc0, [I0|Is]),false,Count0}
+    end;
+unfold_lit_is([#b_set{op=Op,args=Args0}=I0|Is], LitMap, Count, Acc) ->
+    %% Using a register instead of a literal is a clear win only for
+    %% `call` and `old_make_fun` instructions. Substituting into other
+    %% instructions is unlikely to be an improvement.
+    Unfold = case Op of
+                 call -> true;
+                 old_make_fun -> true;
+                 _ -> false
+             end,
+    I = case Unfold of
+            true ->
+                Args = unfold_call_args(Args0, LitMap, -1),
+                I0#b_set{args=Args};
+            false ->
+                I0
+        end,
+    case beam_ssa:clobbers_xregs(I) of
+        true ->
+            %% This instruction clobbers x register. Don't do
+            %% any substitutions in rest of this block or in any
+            %% of its successors.
+            {reverse(Acc, [I|Is]),false,Count};
+        false ->
+            unfold_lit_is(Is, LitMap, Count, [I|Acc])
+    end;
+unfold_lit_is([], _LitMap, Count, Acc) ->
+    {reverse(Acc),true,Count}.
+
+%% unfold_arg_list(Is, ArgumentList, LitMap, Count0, X, Acc) ->
+%%     {UpdatedAcc, Count}.
+%%
+%%  Unfold the arguments in the argument list (second argument for error/2).
+%%
+%%  Note that Is is the reversed list of instructions before the
+%%  call to error/2. Because of the way the list is built in reverse,
+%%  it means that the first put_list instruction found will add the first
+%%  argument (x0) to the list, the second the second argument (x1), and
+%%  so on.
+
+unfold_arg_list(Is, #b_literal{val=[Hd|Tl]}, LitMap, Count0, X, Acc) ->
+    %% Handle the case that the entire argument list (the second argument
+    %% for error/2) is a literal.
+    {PutListDst,Count} = new_var('@put_list', Count0),
+    PutList = #b_set{op=put_list,dst=PutListDst,
+                     args=[#b_literal{val=Hd},#b_literal{val=Tl}]},
+    unfold_arg_list([PutList|Is], PutListDst, LitMap, Count, X, Acc);
+unfold_arg_list([#b_set{op=put_list,dst=List,
+                         args=[Hd0,#b_literal{val=[Hd|Tl]}]}=I0|Is0],
+                 List, LitMap, Count0, X, Acc) ->
+    %% The rest of the argument list is a literal list.
+    {PutListDst,Count} = new_var('@put_list', Count0),
+    PutList = #b_set{op=put_list,dst=PutListDst,
+                     args=[#b_literal{val=Hd},#b_literal{val=Tl}]},
+    I = I0#b_set{args=[Hd0,PutListDst]},
+    unfold_arg_list([I,PutList|Is0], List, LitMap, Count, X, Acc);
+unfold_arg_list([#b_set{op=put_list,dst=List,args=[Hd0,Tl]}=I0|Is],
+                 List, LitMap, Count, X, Acc) ->
+    %% Unfold the head of the list.
+    Hd = unfold_arg(Hd0, LitMap, X),
+    I = I0#b_set{args=[Hd,Tl]},
+    unfold_arg_list(Is, Tl, LitMap, Count, X + 1, [I|Acc]);
+unfold_arg_list([I|Is], List, LitMap, Count, X, Acc) ->
+    %% Some other instruction, such as bs_get_tail.
+    unfold_arg_list(Is, List, LitMap, Count, X, [I|Acc]);
+unfold_arg_list([], _, _, Count, _, Acc) ->
+    {reverse(Acc),Count}.
+
+unfold_call_args([A0|As], LitMap, X) ->
+    A = unfold_arg(A0, LitMap, X),
+    [A|unfold_call_args(As, LitMap, X + 1)];
+unfold_call_args([], _, _) -> [].
+
+unfold_arg(#b_literal{val=Val}=Lit, LitMap, X) ->
+    case LitMap of
+        #{Val:=Vars} ->
+            %% This literal is available in an x register.
+            %% If it is in the correct x register, use
+            %% the register. Don't bother if it is in the
+            %% wrong register, because that would still result
+            %% in a `move` instruction.
+            case keyfind(X, 1, Vars) of
+                false -> Lit;
+                {X,Var} -> Var
+            end;
+        #{} -> Lit
+    end;
+unfold_arg(Expr, _LitMap, _X) -> Expr.
+
+%%%
+%%% Optimize tail calls created as the result of optimizations.
+%%%
+%%% Consider the following example of a tail call in Erlang code:
+%%%
+%%%    bar() ->
+%%%        foo().
+%%%
+%%% The SSA code for the call will look like this:
+%%%
+%%%      @ssa_ret = call (`foo`/0)
+%%%      ret @ssa_ret
+%%%
+%%% Sometimes optimizations create new tail calls. Consider this
+%%% slight variation of the example:
+%%%
+%%%    bar() ->
+%%%        {_,_} = foo().
+%%%
+%%%    foo() -> {a,b}.
+%%%
+%%% If beam_ssa_type can figure out that `foo/0` always returns a tuple
+%%% of size two, the test for a tuple is no longer needed and the call
+%%% to `foo/0` will become a tail call. However, the resulting SSA
+%%% code will look like this:
+%%%
+%%%      @ssa_ret = call (`foo`/0)
+%%%      @ssa_bool = succeeded:body @ssa_ret
+%%%      br @ssa_bool, ^999, ^1
+%%%
+%%%    999:
+%%%      ret @ssa_ret
+%%%
+%%% The beam_ssa_codegen pass will not recognize this code as a tail
+%%% call and will generate an unncessary stack frame. It may also
+%%% generate unecessary `kill` instructions.
+%%%
+%%% To avoid those extra instructions, this optimization will
+%%% eliminate the `succeeded:body` and `br` instructions and insert
+%%% the `ret` in the same block as the call:
+%%%
+%%%      @ssa_ret = call (`foo`/0)
+%%%      ret @ssa_ret
+%%%
+%%% Finally, consider this example:
+%%%
+%%%    bar() ->
+%%%        foo_ok(),
+%%%        ok.
+%%%
+%%%    foo_ok() -> ok.
+%%%
+%%% The SSA code for the call to `foo_ok/0` will look like:
+%%%
+%%%      %% Result type: `ok`
+%%%      @ssa_ignored = call (`foo_ok`/0)
+%%%      @ssa_bool = succeeded:body @ssa_ignored
+%%%      br @ssa_bool, ^999, ^1
+%%%
+%%%    999:
+%%%      ret `ok`
+%%%
+%%% Since the call to `foo_ok/0` has an annotation indicating that the
+%%% call will always return the atom `ok`, the code can be simplified
+%%% like this:
+%%%
+%%%      @ssa_ignored = call (`foo_ok`/0)
+%%%      ret @ssa_ignored
+%%%
+%%% The beam_jump pass does the same optimization, but it does it too
+%%% late to avoid creating an uncessary stack frame or unnecessary
+%%% `kill` instructions.
+%%%
+
+ssa_opt_tail_calls({St,FuncDb}) ->
+    #opt_st{ssa=Blocks0} = St,
+    Blocks = opt_tail_calls(beam_ssa:rpo(Blocks0), Blocks0),
+    {St#opt_st{ssa=Blocks},FuncDb}.
+
+opt_tail_calls([L|Ls], Blocks0) ->
+    #b_blk{is=Is0,last=Last} = Blk0 = map_get(L, Blocks0),
+
+    %% Does this block end with a two-way branch whose success
+    %% label targets an empty block with a `ret` terminator?
+    case is_potential_tail_call(Last, Blocks0) of
+        {yes,Bool,Ret} ->
+            %% Yes, `Ret` is the value returned from that block
+            %% (either a variable or literal). Do the instructions
+            %% in this block end with a `call` instruction that
+            %% returns the same value as `Ret`, followed by a
+            %% `succeeded:body` instruction?
+            case is_tail_call_is(Is0, Bool, Ret, []) of
+                {yes,Is,Var} ->
+                    %% Yes, this is a tail call. `Is` is the instructions
+                    %% in the block with `succeeded:body` removed, and
+                    %% `Var` is the destination variable for the return
+                    %% value of the call. Rewrite this block to directly
+                    %% return `Var`.
+                    Blk = Blk0#b_blk{is=Is,last=#b_ret{arg=Var}},
+                    Blocks = Blocks0#{L:=Blk},
+                    opt_tail_calls(Ls, Blocks);
+                no ->
+                    %% No, the block does not end with a call, or the
+                    %% the call instruction has not the same value
+                    %% as `Ret`.
+                    opt_tail_calls(Ls, Blocks0)
+            end;
+        no ->
+            opt_tail_calls(Ls, Blocks0)
+    end;
+opt_tail_calls([], Blocks) -> Blocks.
+
+is_potential_tail_call(#b_br{bool=#b_var{}=Bool,succ=Succ}, Blocks) ->
+    case Blocks of
+        #{Succ := #b_blk{is=[],last=#b_ret{arg=Arg}}} ->
+            %% This could be a tail call.
+            {yes,Bool,Arg};
+        #{} ->
+            %% The block is not empty or does not have a `ret` terminator.
+            no
+    end;
+is_potential_tail_call(_, _) ->
+    %% Not a two-way branch (a `succeeded:body` instruction must be
+    %% followed by a two-way branch).
+    no.
+
+is_tail_call_is([#b_set{op=call,dst=Dst}=Call,
+                 #b_set{op={succeeded,body},dst=Bool}],
+                Bool, Ret, Acc) ->
+    IsTailCall =
+        case Ret of
+            #b_literal{val=Val} ->
+                %% The return value for this function is a literal.
+                %% Now test whether it is the same literal that the
+                %% `call` instruction returns.
+                Type = beam_ssa:get_anno(result_type, Call, any),
+                case beam_types:get_singleton_value(Type) of
+                    {ok,Val} ->
+                        %% Same value.
+                        true;
+                    {ok,_} ->
+                        %% Wrong value.
+                        false;
+                    error ->
+                        %% The type for the return value is not a singleton value.
+                        false
+                end;
+            #b_var{} ->
+                %% It is a tail call if the variable set by the `call` instruction
+                %% is the same variable as the argument for the `ret` terminator.
+                Ret =:= Dst
+        end,
+    case IsTailCall of
+        true ->
+            %% Return the instructions in the block with `succeeded:body` removed.
+            Is = reverse(Acc, [Call]),
+            {yes,Is,Dst};
+        false ->
+            no
+    end;
+is_tail_call_is([I|Is], Bool, Ret, Acc) ->
+    is_tail_call_is(Is, Bool, Ret, [I|Acc]);
+is_tail_call_is([], _Bool, _Ret, _Acc) -> no.
 
 %%%
 %%% Common utilities.
 %%%
 
-gcd(A, B) ->
-    case A rem B of
-        0 -> B;
-        X -> gcd(B, X)
-    end.
+list_set_union([], Set) ->
+    Set;
+list_set_union([E], Set) ->
+    sets:add_element(E, Set);
+list_set_union(List, Set) ->
+    sets:union(sets:from_list(List, [{version, 2}]), Set).
+
+non_guards(Linear) ->
+    gb_sets:from_list(non_guards_1(Linear)).
+
+non_guards_1([{L,#b_blk{is=Is}}|Bs]) ->
+    case Is of
+        [#b_set{op=landingpad}|_] ->
+            [L | non_guards_1(Bs)];
+        _ ->
+            non_guards_1(Bs)
+    end;
+non_guards_1([]) ->
+    [?EXCEPTION_BLOCK].
 
 rel2fam(S0) ->
     S1 = sofs:relation(S0),
@@ -2279,4 +3160,6 @@ new_var(#b_var{name={Base,N}}, Count) ->
     true = is_integer(N),                       %Assertion.
     {#b_var{name={Base,Count}},Count+1};
 new_var(#b_var{name=Base}, Count) ->
+    {#b_var{name={Base,Count}},Count+1};
+new_var(Base, Count) when is_atom(Base) ->
     {#b_var{name={Base,Count}},Count+1}.

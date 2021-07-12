@@ -1,7 +1,7 @@
 %%
 %% %CopyrightBegin%
 %%
-%% Copyright Ericsson AB 1999-2018. All Rights Reserved.
+%% Copyright Ericsson AB 1999-2020. All Rights Reserved.
 %%
 %% Licensed under the Apache License, Version 2.0 (the "License");
 %% you may not use this file except in compliance with the License.
@@ -22,7 +22,6 @@
 -module(beam_jump).
 
 -export([module/2,
-	 is_exit_instruction/1,
 	 remove_unused_labels/1]).
 
 %%% The following optimisations are done:
@@ -132,9 +131,11 @@
 %%% on the program state.
 %%% 
 
--import(lists, [foldl/3,mapfoldl/3,reverse/1,reverse/2]).
+-import(lists, [foldl/3,keymember/3,mapfoldl/3,reverse/1,reverse/2]).
 
 -type instruction() :: beam_utils:instruction().
+
+-include("beam_types.hrl").
 
 -spec module(beam_utils:module_code(), [compile:option()]) ->
                     {'ok',beam_utils:module_code()}.
@@ -179,22 +180,38 @@ function({function,Name,Arity,CLabel,Asm0}, Lc0) ->
 eliminate_moves(Is) ->
     eliminate_moves(Is, #{}, []).
 
-eliminate_moves([{select,select_val,Reg,_,List}=I|Is], D0, Acc) ->
-    D = update_value_dict(List, Reg, D0),
+eliminate_moves([{select,select_val,Reg,{f,Fail},List}=I|Is], D0, Acc) ->
+    D1 = add_unsafe_label(Fail, D0),
+    D = update_value_dict(List, Reg, D1),
     eliminate_moves(Is, D, [I|Acc]);
-eliminate_moves([{label,Lbl},{block,[{set,[Dst],[Lit],move}|BlkIs]}=Blk0|Is],
-        D, Acc0) ->
-    Acc = [{label,Lbl}|Acc0],
-    case already_has_value(Lit, Lbl, Dst, D) andalso
-        no_fallthrough(Acc0) of
+eliminate_moves([{test,is_eq_exact,_,[Reg,Val]}=I,
+                 {block,BlkIs0}|Is], D0, Acc) ->
+    D = update_unsafe_labels(I, D0),
+    RegVal = {Reg,Val},
+    BlkIs = eliminate_moves_blk(BlkIs0, RegVal),
+    eliminate_moves([{block,BlkIs}|Is], D, [I|Acc]);
+eliminate_moves([{test,is_nonempty_list,Fail,[Reg]}=I|Is], D0, Acc) ->
+    case is_proper_list(Reg, Acc) of
         true ->
-            %% Remove redundant 'move' instruction.
-            Blk = {block,BlkIs},
-            eliminate_moves([Blk|Is], D, Acc);
+            D = update_value_dict([nil,Fail], Reg, D0),
+            eliminate_moves(Is, D, [I|Acc]);
         false ->
-            %% Keep 'move' instruction.
-            eliminate_moves([Blk0|Is], D, Acc)
+            D = update_unsafe_labels(I, D0),
+            eliminate_moves(Is, D, [I|Acc])
     end;
+eliminate_moves([{label,Lbl},{block,BlkIs0}=Blk|Is], D, Acc0) ->
+    Acc = [{label,Lbl}|Acc0],
+    case {no_fallthrough(Acc0),D} of
+        {true,#{Lbl:={_,_}=RegVal}} ->
+            BlkIs = eliminate_moves_blk(BlkIs0, RegVal),
+            eliminate_moves([{block,BlkIs}|Is], D, Acc);
+        {_,_} ->
+            eliminate_moves([Blk|Is], D, Acc)
+    end;
+eliminate_moves([{call,_,_}=I|Is], D, Acc) ->
+    eliminate_moves_call(Is, D, [I | Acc]);
+eliminate_moves([{call_ext,_,_}=I|Is], D, Acc) ->
+    eliminate_moves_call(Is, D, [I | Acc]);
 eliminate_moves([{block,[]}|Is], D, Acc) ->
     %% Empty blocks can prevent further jump optimizations.
     eliminate_moves(Is, D, Acc);
@@ -203,16 +220,54 @@ eliminate_moves([I|Is], D0, Acc) ->
     eliminate_moves(Is, D, [I|Acc]);
 eliminate_moves([], _, Acc) -> reverse(Acc).
 
+eliminate_moves_call([{'%',{var_info,{x,0},Info}}=Anno,
+                      {block,BlkIs0}=Blk | Is], D, Acc0) ->
+    Acc = [Anno | Acc0],
+    RetType = proplists:get_value(type, Info, none),
+    case beam_types:get_singleton_value(RetType) of
+        {ok, Value} ->
+            RegVal = {{x,0}, value_to_literal(Value)},
+            BlkIs = eliminate_moves_blk(BlkIs0, RegVal),
+            eliminate_moves([{block,BlkIs}|Is], D, Acc);
+        error ->
+            eliminate_moves(Is, D, [Blk | Acc])
+    end;
+eliminate_moves_call(Is, D, Acc) ->
+    eliminate_moves(Is, D, Acc).
+
+eliminate_moves_blk([{set,[Dst],[_],move}|_]=Is, {_,Dst}) ->
+    Is;
+eliminate_moves_blk([{set,[Dst],[Lit],move}|Is], {Dst,Lit}) ->
+    %% Remove redundant 'move' instruction.
+    Is;
+eliminate_moves_blk([{set,[Dst],[_],move}|_]=Is, {Dst,_}) ->
+    Is;
+eliminate_moves_blk([{set,[_],[_],move}=I|Is], {_,_}=RegVal) ->
+    [I|eliminate_moves_blk(Is, RegVal)];
+eliminate_moves_blk(Is, _) -> Is.
+
+no_fallthrough([{'%',_} | Is]) ->
+    no_fallthrough(Is);
 no_fallthrough([I|_]) ->
     is_unreachable_after(I).
 
-already_has_value(Lit, Lbl, Reg, D) ->
-    case D of
-        #{Lbl:={Reg,Lit}} ->
+is_proper_list(Reg, [{'%',{var_info,Reg,Info}}|_]) ->
+    case proplists:get_value(type, Info) of
+        #t_list{terminator=nil} ->
             true;
-        #{} ->
+        _ ->
+            %% Unknown type or not a proper list.
             false
-    end.
+    end;
+is_proper_list(Reg, [{'%',{var_info,_,_}}|Is]) ->
+    is_proper_list(Reg, Is);
+is_proper_list(_, _) -> false.
+
+value_to_literal([]) -> nil;
+value_to_literal(A) when is_atom(A) -> {atom,A};
+value_to_literal(F) when is_float(F) -> {float,F};
+value_to_literal(I) when is_integer(I) -> {integer,I};
+value_to_literal(Other) -> {literal,Other}.
 
 update_value_dict([Lit,{f,Lbl}|T], Reg, D0) ->
     D = case D0 of
@@ -223,6 +278,9 @@ update_value_dict([Lit,{f,Lbl}|T], Reg, D0) ->
         end,
     update_value_dict(T, Reg, D);
 update_value_dict([], _, D) -> D.
+
+add_unsafe_label(L, D) ->
+    D#{L=>unsafe}.
 
 update_unsafe_labels(I, D) ->
     Ls = instr_labels(I),
@@ -258,80 +316,205 @@ insert_labels([], Lc, Acc) ->
 %%% (1) We try to share the code for identical code segments by replacing all
 %%% occurrences except the last with jumps to the last occurrence.
 %%%
+%%% We must not share code that raises an exception from outside a
+%%% try/catch block with code inside a try/catch block and vice versa,
+%%% because beam_validator will probably flag it as unsafe
+%%% (ambiguous_catch_try_state). The same goes for a plain catch.
+%%%
 
 share(Is0) ->
     Is1 = eliminate_fallthroughs(Is0, []),
     Is2 = find_fixpoint(fun(Is) ->
-                                share_1(Is, #{}, #{}, [], [])
+                                share_1(Is)
                         end, Is1),
     reverse(Is2).
 
-share_1([{label,L}=Lbl|Is], Dict0, Lbls0, [_|_]=Seq, Acc) ->
-    case maps:find(Seq, Dict0) of
-        error ->
-            Dict = maps:put(Seq, L, Dict0),
-            share_1(Is, Dict, Lbls0, [], [[Lbl|Seq]|Acc]);
-        {ok,Label} ->
-            Lbls = maps:put(L, Label, Lbls0),
-            share_1(Is, Dict0, Lbls, [], [[Lbl,{jump,{f,Label}}]|Acc])
+share_1(Is) ->
+    Safe = classify_labels(Is),
+    share_1(Is, Safe, #{}, #{}, [], []).
+
+%% Note that we examine the instructions in reverse execution order.
+share_1([{label,L}=Lbl|Is], Safe, Dict0, Lbls0, [_|_]=Seq0, Acc) ->
+    Seq = maybe_add_scope(Seq0, L, Safe),
+
+    %% If there are try/catch or catch instructions in this function,
+    %% any line instructions in the sequence now include a scope.
+    case Dict0 of
+        #{Seq := Label} ->
+            %% This sequence of instructions has been seen previously.
+            %% The scope identifiers added to line instructions ensure
+            %% that two sequence will not be equal unless sharing is
+            %% also safe.
+            Lbls = Lbls0#{L => Label},
+            share_1(Is, Safe, Dict0, Lbls, [],
+                    [[Lbl,{jump,{f,Label}}]|Acc]);
+        #{} ->
+            %% This is first time we have seen this sequence of instructions.
+            %% Find out whether it is safe to share the sequence.
+            case (map_size(Safe) =:= 0 orelse
+                  is_shareable(Seq)) andalso
+                unambigous_exit_call(Seq)
+            of
+                true ->
+                    %% Either this function does not contain any try/catch
+                    %% instructions, in which case it is always safe to share
+                    %% exception-raising instructions such as if_end and
+                    %% case_end, or it this sequence does not include
+                    %% any problematic instructions.
+                    Dict = Dict0#{Seq => L},
+                    share_1(Is, Safe, Dict, Lbls0, [], [[Lbl|Seq]|Acc]);
+                false ->
+                    %% The sequence includes an inappropriate instruction
+                    %% that may case beam_validator to complain about
+                    %% an ambiguous try/catch state.
+                    share_1(Is, Safe, Dict0, Lbls0, [], [[Lbl|Seq]|Acc])
+            end
     end;
-share_1([{func_info,_,_,_}|_]=Is0, _, Lbls, [], Acc0) when Lbls =/= #{} ->
-    lists:foldl(fun(Is, Acc) ->
-        beam_utils:replace_labels(Is, Acc, Lbls, fun(Old) -> Old end)
-    end, Is0, Acc0);
-share_1([{func_info,_,_,_}|_]=Is, _, Lbls, [], Acc) when Lbls =:= #{} ->
-    lists:foldl(fun lists:reverse/2, Is, Acc);
-share_1([{'catch',_,_}=I|Is], Dict0, Lbls0, Seq, Acc) ->
-    {Dict,Lbls} = clean_non_sharable(Dict0, Lbls0),
-    share_1(Is, Dict, Lbls, [I|Seq], Acc);
-share_1([{'try',_,_}=I|Is], Dict0, Lbls0, Seq, Acc) ->
-    {Dict,Lbls} = clean_non_sharable(Dict0, Lbls0),
-    share_1(Is, Dict, Lbls, [I|Seq], Acc);
-share_1([{try_case,_}=I|Is], Dict0, Lbls0, Seq, Acc) ->
-    {Dict,Lbls} = clean_non_sharable(Dict0, Lbls0),
-    share_1(Is, Dict, Lbls, [I|Seq], Acc);
-share_1([{catch_end,_}=I|Is], Dict0, Lbls0, Seq, Acc) ->
-    {Dict,Lbls} = clean_non_sharable(Dict0, Lbls0),
-    share_1(Is, Dict, Lbls, [I|Seq], Acc);
-share_1([{jump,{f,To}}=I,{label,L}=Lbl|Is], Dict0, Lbls0, _Seq, Acc) ->
-    Lbls = maps:put(L, To, Lbls0),
-    share_1(Is, Dict0, Lbls, [], [[Lbl,I]|Acc]);
-share_1([I|Is], Dict, Lbls, Seq, Acc) ->
+share_1([{func_info,_,_,_}|_]=Is0, _Safe, _, Lbls, [], Acc0) ->
+    %% Replace jumps to jumps with a jump to the final destination
+    %% (jump threading). This optimization is done in the main
+    %% optimization pass of this module, but we do it here too because
+    %% it can give more opportunities for sharing code.
+    F = case Lbls =:= #{} of
+            true ->
+                fun lists:reverse/2;
+            false ->
+                fun(Is, Acc) ->
+                        beam_utils:replace_labels(Is, Acc, Lbls,
+                                                  fun(Old) -> Old end)
+                end
+        end,
+    foldl(F, Is0, Acc0);
+share_1([{'catch',_,_}=I|Is], Safe, Dict, _Lbls0, Seq, Acc) ->
+    %% Disable the jump threading optimization because it may be unsafe.
+    share_1(Is, Safe, Dict, #{}, [I|Seq], Acc);
+share_1([{'try',_,_}=I|Is], Safe, Dict, _Lbls, Seq, Acc) ->
+    %% Disable the jump threading optimization because it may be unsafe.
+    share_1(Is, Safe, Dict, #{}, [I|Seq], Acc);
+share_1([{jump,{f,To}}=I,{label,From}=Lbl|Is], Safe, Dict0, Lbls0, _Seq, Acc) ->
+    Lbls = Lbls0#{From => To},
+    share_1(Is, Safe, Dict0, Lbls, [], [[Lbl,I]|Acc]);
+share_1([I|Is], Safe, Dict, Lbls, Seq, Acc) ->
     case is_unreachable_after(I) of
 	false ->
-	    share_1(Is, Dict, Lbls, [I|Seq], Acc);
+	    share_1(Is, Safe, Dict, Lbls, [I|Seq], Acc);
 	true ->
-	    share_1(Is, Dict, Lbls, [I], Acc)
+	    share_1(Is, Safe, Dict, Lbls, [I], Acc)
     end.
 
-clean_non_sharable(Dict0, Lbls0) ->
-    %% We are passing in or out of a 'catch' or 'try' block. Remove
-    %% sequences that should not be shared over the boundaries of the
-    %% block. Since the end of the sequence must match, the only
-    %% possible match between a sequence outside and a sequence inside
-    %% the 'catch'/'try' block is a sequence that ends with an
-    %% instruction that causes an exception. Any sequence that causes
-    %% an exception must contain a line/1 instruction.
-    Dict1 = maps:to_list(Dict0),
-    Lbls1 = maps:to_list(Lbls0),
-    {Dict2,Lbls2} = foldl(fun({K, V}, {Dict,Lbls}) ->
-                                  case sharable_with_try(K) of
-                                      true ->
-                                          {[{K,V}|Dict],lists:keydelete(V, 2, Lbls)};
-                                      false ->
-                                          {Dict,Lbls}
-                                  end
-                          end, {[],Lbls1}, Dict1),
-    {maps:from_list(Dict2),maps:from_list(Lbls2)}.
+unambigous_exit_call([{call_ext,A,{extfunc,M,F,A}}|Is]) ->
+    case erl_bifs:is_exit_bif(M, F, A) of
+        true ->
+            %% beam_validator requires that the size of the stack
+            %% frame is unambigously known when a function is called.
+            %%
+            %% That means that we must be careful when sharing function
+            %% calls.
+            %%
+            %% In practice, it seems that only exit BIFs can
+            %% potentially be shared in an unsafe way, and only in
+            %% rare circumstances. (See the undecided_allocation_1/1
+            %% function in beam_jump_SUITE.)
+            %%
+            %% To ensure that the frame size is unambigous, only allow
+            %% sharing of a call to exit BIFs if the call is followed
+            %% by an instruction that indicates the size of the stack
+            %% frame (that is almost always the case in real-world
+            %% code).
+            case Is of
+                [{deallocate,_}|_] -> true;
+                [return] -> true;
+                _ -> false
+            end;
+        false ->
+            true
+    end;
+unambigous_exit_call([_|Is]) ->
+    unambigous_exit_call(Is);
+unambigous_exit_call([]) -> true.
 
-sharable_with_try([{line,_}|_]) ->
-    %% This sequence may cause an exception and may potentially
-    %% match a sequence on the other side of the 'catch'/'try' block
-    %% boundary.
-    false;
-sharable_with_try([_|Is]) ->
-    sharable_with_try(Is);
-sharable_with_try([]) -> true.
+%% If the label has a scope set, assign it to any line instruction
+%% in the sequence.
+maybe_add_scope(Seq, L, Safe) ->
+    case Safe of
+        #{L := Scope} -> add_scope(Seq, Scope);
+        #{} -> Seq
+    end.
+
+add_scope([{line,Loc}=I|Is], Scope) ->
+    case keymember(scope, 1, Loc) of
+        false ->
+            [{line,[{scope,Scope}|Loc]}|add_scope(Is, Scope)];
+        true ->
+            [I|add_scope(Is, Scope)]
+    end;
+add_scope([I|Is], Scope) ->
+    [I|add_scope(Is, Scope)];
+add_scope([], _Scope) -> [].
+
+is_shareable([build_stacktrace|_]) -> false;
+is_shareable([{case_end,_}|_]) -> false;
+is_shareable([{'catch',_,_}|_]) -> false;
+is_shareable([{catch_end,_}|_]) -> false;
+is_shareable([if_end|_]) -> false;
+is_shareable([{'try',_,_}|_]) -> false;
+is_shareable([{try_case,_}|_]) -> false;
+is_shareable([{try_end,_}|_]) -> false;
+is_shareable([_|Is]) -> is_shareable(Is);
+is_shareable([]) -> true.
+
+%%
+%% Classify labels according to where the instructions that branch to
+%% the labels are located. Each label is assigned a set of scope
+%% identifers (but usually just one). If two labels have different
+%% scope identfiers, sharing a sequence that raises an exception
+%% between the labels may not be safe, because one label is inside a
+%% try/catch, and the other label is outside. Note that we don't care
+%% where the labels themselves are located, only from where the
+%% branches to them are located.
+%%
+%% If there is more than one scope in the function (that is, if there
+%% try/catch or catch in the function), the scope identifiers will be
+%% added to the line instructions. Recording the scope in the line
+%% instructions makes beam_jump idempotent, ensuring that beam_jump
+%% will not do any unsafe optimizations when when compiling from a .S
+%% file.
+%%
+
+classify_labels(Is) ->
+    classify_labels(Is, 0, #{}).
+
+classify_labels([{'catch',_,_}|Is], Scope, Safe) ->
+    classify_labels(Is, Scope+1, Safe);
+classify_labels([{catch_end,_}|Is], Scope, Safe) ->
+    classify_labels(Is, Scope+1, Safe);
+classify_labels([{'try',_,_}|Is], Scope, Safe) ->
+    classify_labels(Is, Scope+1, Safe);
+classify_labels([{'try_end',_}|Is], Scope, Safe) ->
+    classify_labels(Is, Scope+1, Safe);
+classify_labels([{'try_case',_}|Is], Scope, Safe) ->
+    classify_labels(Is, Scope+1, Safe);
+classify_labels([{'try_case_end',_}|Is], Scope, Safe) ->
+    classify_labels(Is, Scope+1, Safe);
+classify_labels([I|Is], Scope, Safe0) ->
+    Labels = instr_labels(I),
+    Safe = foldl(fun(L, A) ->
+                         case A of
+                             #{L := [Scope]} -> A;
+                             #{L := Other} -> A#{L => ordsets:add_element(Scope, Other)};
+                             #{} -> A#{L => [Scope]}
+                         end
+                 end, Safe0, Labels),
+    classify_labels(Is, Scope, Safe);
+classify_labels([], Scope, Safe) ->
+    case Scope of
+        0 ->
+            %% No try/catch or catch in this function. We don't
+            %% need the collected information.
+            #{};
+        _ ->
+            Safe
+    end.
 
 %% Eliminate all fallthroughs. Return the result reversed.
 
@@ -398,7 +581,7 @@ extract_seq_1(_, _) -> no.
 	{
 	  entry :: beam_asm:label(), %Entry label (must not be moved).
 	  replace :: #{beam_asm:label() := beam_asm:label()}, %Labels to replace.
-	  labels :: cerl_sets:set()         %Set of referenced labels.
+	  labels :: sets:set()         %Set of referenced labels.
 	}).
 
 opt(Is0, CLabel) ->
@@ -462,8 +645,6 @@ opt([{jump,{f,L}=Lbl}=I|Is], Acc0, St0) ->
 %% Optimization: quickly handle some common instructions that don't
 %% have any failure labels and where is_unreachable_after(I) =:= false.
 opt([{block,_}=I|Is], Acc, St) ->
-    opt(Is, [I|Acc], St);
-opt([{kill,_}=I|Is], Acc, St) ->
     opt(Is, [I|Acc], St);
 opt([{call,_,_}=I|Is], Acc, St) ->
     opt(Is, [I|Acc], St);
@@ -542,7 +723,7 @@ skip_unreachable([], Acc, St) ->
 
 %% Add one or more label to the set of used labels.
 
-label_used({f,L}, St) -> St#st{labels=cerl_sets:add_element(L,St#st.labels)};
+label_used({f,L}, St) -> St#st{labels=sets:add_element(L,St#st.labels)};
 label_used([H|T], St0) -> label_used(T, label_used(H, St0));
 label_used([], St) -> St;
 label_used(_Other, St) -> St.
@@ -550,7 +731,7 @@ label_used(_Other, St) -> St.
 %% Test if label is used.
 
 is_label_used(L, St) ->
-    cerl_sets:is_element(L, St#st.labels).
+    sets:is_element(L, St#st.labels).
 
 %% is_unreachable_after(Instruction) -> boolean()
 %%  Test whether the code after Instruction is unreachable.
@@ -571,8 +752,6 @@ is_unreachable_after(I) -> is_exit_instruction(I).
 
 -spec is_exit_instruction(instruction()) -> boolean().
 
-is_exit_instruction({call_ext,_,{extfunc,M,F,A}}) ->
-    erl_bifs:is_exit_bif(M, F, A);
 is_exit_instruction(if_end) -> true;
 is_exit_instruction({case_end,_}) -> true;
 is_exit_instruction({try_case_end,_}) -> true;
@@ -591,7 +770,7 @@ remove_unused_labels(Is) ->
     rem_unused(Is, Used, []).
 
 rem_unused([{label,Lbl}=I|Is0], Used, [Prev|_]=Acc) ->
-    case cerl_sets:is_element(Lbl, Used) of
+    case sets:is_element(Lbl, Used) of
 	false ->
 	    Is = case is_unreachable_after(Prev) of
 		     true -> drop_upto_label(Is0);
@@ -613,7 +792,7 @@ initial_labels([{line,_}|Is], Acc) ->
 initial_labels([{label,Lbl}|Is], Acc) ->
     initial_labels(Is, [Lbl|Acc]);
 initial_labels([{func_info,_,_,_},{label,Lbl}|_], Acc) ->
-    cerl_sets:from_list([Lbl|Acc]).
+    sets:from_list([Lbl|Acc], [{version, 2}]).
 
 drop_upto_label([{label,_}|_]=Is) -> Is;
 drop_upto_label([_|Is]) -> drop_upto_label(Is);
@@ -664,13 +843,13 @@ ulbl(I, Used) ->
         [] ->
             Used;
         [Lbl] ->
-            cerl_sets:add_element(Lbl, Used);
+            sets:add_element(Lbl, Used);
         [_|_]=L ->
             ulbl_list(L, Used)
     end.
 
 ulbl_list([L|Ls], Used) ->
-    ulbl_list(Ls, cerl_sets:add_element(L, Used));
+    ulbl_list(Ls, sets:add_element(L, Used));
 ulbl_list([], Used) -> Used.
 
 -spec instr_labels(Instruction) -> Labels when
@@ -709,13 +888,13 @@ instr_labels({put_map,Lbl,_Op,_Src,_Dst,_Live,_List}) ->
     do_instr_labels(Lbl);
 instr_labels({get_map_elements,Lbl,_Src,_List}) ->
     do_instr_labels(Lbl);
-instr_labels({recv_mark,Lbl}) ->
-    do_instr_labels(Lbl);
-instr_labels({recv_set,Lbl}) ->
-    do_instr_labels(Lbl);
-instr_labels({fcheckerror,Lbl}) ->
-    do_instr_labels(Lbl);
-instr_labels(_) -> [].
+instr_labels({bs_start_match4,Fail,_,_,_}) ->
+    case Fail of
+        {f,L} -> [L];
+        {atom,_} -> []
+    end;
+instr_labels(_) ->
+    [].
 
 do_instr_labels({f,0}) -> [];
 do_instr_labels({f,F}) -> [F].

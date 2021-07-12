@@ -1,7 +1,7 @@
 %%
 %% %CopyrightBegin%
 %%
-%% Copyright Ericsson AB 2018. All Rights Reserved.
+%% Copyright Ericsson AB 2018-2020. All Rights Reserved.
 %%
 %% Licensed under the Apache License, Version 2.0 (the "License");
 %% you may not use this file except in compliance with the License.
@@ -28,8 +28,9 @@
 
 -include("beam_ssa.hrl").
 
--import(lists, [foldl/3,keymember/3,keysort/2,last/1,map/2,mapfoldl/3,
-                reverse/1,reverse/2,sort/1,splitwith/2,takewhile/2]).
+-import(lists, [foldl/3,keymember/3,keysort/2,map/2,mapfoldl/3,
+                member/2,reverse/1,reverse/2,sort/1,
+                splitwith/2,takewhile/2]).
 
 -record(cg, {lcount=1 :: beam_label(),          %Label counter
 	     functable=#{} :: #{fa()=>beam_label()},
@@ -37,7 +38,8 @@
              used_labels=gb_sets:empty() :: gb_sets:set(ssa_label()),
              regs=#{} :: #{beam_ssa:var_name()=>ssa_register()},
              ultimate_fail=1 :: beam_label(),
-             catches=gb_sets:empty() :: gb_sets:set(ssa_label())
+             catches=gb_sets:empty() :: gb_sets:set(ssa_label()),
+             fc_label=1 :: beam_label()
              }).
 
 -spec module(beam_ssa:b_module(), [compile:option()]) ->
@@ -47,8 +49,9 @@ module(#b_module{name=Mod,exports=Es,attributes=Attrs,body=Fs}, _Opts) ->
     {Asm,St} = functions(Fs, {atom,Mod}),
     {ok,{Mod,Es,Attrs,Asm,St#cg.lcount}}.
 
--record(need, {h=0 :: non_neg_integer(),
-               f=0 :: non_neg_integer()}).
+-record(need, {h=0 :: non_neg_integer(),   % heap words
+               l=0 :: non_neg_integer(),   % lambdas (funs)
+               f=0 :: non_neg_integer()}). % floats
 
 -record(cg_blk, {anno=#{} :: anno(),
                  is=[] :: [instruction()],
@@ -56,7 +59,7 @@ module(#b_module{name=Mod,exports=Es,attributes=Attrs,body=Fs}, _Opts) ->
 
 -record(cg_set, {anno=#{} :: anno(),
                  dst :: b_var(),
-                 op :: beam_ssa:op(),
+                 op :: beam_ssa:op() | 'nop',
                  args :: [beam_ssa:argument() | xreg()]}).
 
 -record(cg_alloc, {anno=#{} :: anno(),
@@ -114,17 +117,17 @@ functions(Forms, AtomMod) ->
 function(#b_function{anno=Anno,bs=Blocks}, AtomMod, St0) ->
     #{func_info:={_,Name,Arity}} = Anno,
     try
-        assert_badarg_block(Blocks),            %Assertion.
+        assert_exception_block(Blocks),            %Assertion.
         Regs = maps:get(registers, Anno),
         St1 = St0#cg{labels=#{},used_labels=gb_sets:empty(),
                      regs=Regs},
         {Fi,St2} = new_label(St1),              %FuncInfo label
         {Entry,St3} = local_func_label(Name, Arity, St2),
         {Ult,St4} = new_label(St3),             %Ultimate failure
-        Labels = (St4#cg.labels)#{0=>Entry,?BADARG_BLOCK=>0},
+        Labels = (St4#cg.labels)#{0=>Entry,?EXCEPTION_BLOCK=>0},
         St5 = St4#cg{labels=Labels,used_labels=gb_sets:singleton(Entry),
                      ultimate_fail=Ult},
-        {Body,St} = cg_fun(Blocks, St5),
+        {Body,St} = cg_fun(Blocks, St5#cg{fc_label=Fi}),
         Asm = [{label,Fi},line(Anno),
                {func_info,AtomMod,{atom,Name},Arity}] ++
                add_parameter_annos(Body, Anno) ++
@@ -137,10 +140,10 @@ function(#b_function{anno=Anno,bs=Blocks}, AtomMod, St0) ->
             erlang:raise(Class, Error, Stack)
     end.
 
-assert_badarg_block(Blocks) ->
-    %% Assertion: ?BADARG_BLOCK must be the call erlang:error(badarg).
+assert_exception_block(Blocks) ->
+    %% Assertion: ?EXCEPTION_BLOCK must be a call erlang:error(badarg).
     case Blocks of
-        #{?BADARG_BLOCK:=Blk} ->
+        #{?EXCEPTION_BLOCK:=Blk} ->
             #b_blk{is=[#b_set{op=call,dst=Ret,
                               args=[#b_remote{mod=#b_literal{val=erlang},
                                               name=#b_literal{val=error}},
@@ -148,19 +151,21 @@ assert_badarg_block(Blocks) ->
                    last=#b_ret{arg=Ret}} = Blk,
             ok;
         #{} ->
-            %% ?BADARG_BLOCK has been removed because it was never used.
+            %% ?EXCEPTION_BLOCK has been removed because it was never used.
             ok
     end.
 
 add_parameter_annos([{label, _}=Entry | Body], Anno) ->
-    ParamInfo = maps:get(parameter_type_info, Anno, #{}),
+    ParamTypes = maps:get(parameter_info, Anno, #{}),
+
     Annos = maps:fold(
-        fun(K, V, Acc) when is_map_key(K, ParamInfo) ->
-                TypeInfo = maps:get(K, ParamInfo),
-                [{'%', {type_info, V, TypeInfo}} | Acc];
+        fun(K, V, Acc) when is_map_key(K, ParamTypes) ->
+                Info = map_get(K, ParamTypes),
+                [{'%', {var_info, V, Info}} | Acc];
            (_K, _V, Acc) ->
                 Acc
         end, [], maps:get(registers, Anno)),
+
     [Entry | sort(Annos)] ++ Body.
 
 cg_fun(Blocks, St0) ->
@@ -170,7 +175,8 @@ cg_fun(Blocks, St0) ->
     Linear2 = prefer_xregs(Linear1, St),
     Linear3 = liveness(Linear2, St),
     Linear4 = defined(Linear3, St),
-    Linear = opt_allocate(Linear4, St),
+    Linear5 = opt_allocate(Linear4, St),
+    Linear = fix_wait_timeout(Linear5),
     cg_linear(Linear, St).
 
 %% collect_catch_labels(Linear, St) -> St.
@@ -193,7 +199,7 @@ collect_catch_labels_1([]) -> [].
 
 need_heap(Bs0) ->
     Bs1 = need_heap_allocs(Bs0, #{}),
-    {Bs,#need{h=0,f=0}} = need_heap_blks(reverse(Bs1), #need{}, []),
+    {Bs,#need{h=0,l=0,f=0}} = need_heap_blks(reverse(Bs1), #need{}, []),
     Bs.
 
 need_heap_allocs([{L,#cg_blk{is=Is0,last=Terminator}=Blk0}|Bs], Counts0) ->
@@ -224,10 +230,15 @@ need_heap_allocs([{L,#cg_blk{is=Is0,last=Terminator}=Blk0}|Bs], Counts0) ->
     end;
 need_heap_allocs([], _) -> [].
 
-need_heap_never([#cg_alloc{}|_]) -> true;
-need_heap_never([#cg_set{op=recv_next}|_]) -> true;
-need_heap_never([#cg_set{op=wait}|_]) -> true;
-need_heap_never(_) -> false.
+need_heap_never([#cg_alloc{}|_]) ->
+    true;
+need_heap_never([#cg_set{op=recv_next}|_]) ->
+    true;
+need_heap_never([#cg_set{op=wait_timeout,
+                         args=[#b_literal{val=infinity}]}|_]) ->
+    true;
+need_heap_never(_) ->
+    false.
 
 need_heap_blks([{L,#cg_blk{is=Is0}=Blk0}|Bs], H0, Acc) ->
     {Is1,H1} = need_heap_is(reverse(Is0), H0, []),
@@ -253,6 +264,8 @@ need_heap_is([#cg_set{op=Op,args=Args}=I|Is], N, Acc) ->
         {put,Words} ->
             %% Pass through adding to needed heap.
             need_heap_is(Is, add_heap_words(N, Words), [I|Acc]);
+        {put_fun,NArgs} ->
+            need_heap_is(Is, add_heap_fun(N, NArgs), [I|Acc]);
         put_float ->
             need_heap_is(Is, add_heap_float(N), [I|Acc]);
         neutral ->
@@ -277,7 +290,7 @@ need_heap_terminator([{_,#cg_blk{is=Is,last=#cg_br{succ=L}}}|_], L, N) ->
             case reverse(Is) of
                 [#cg_set{op=succeeded},#cg_set{op=bs_init}|_] ->
                     {[],N};
-                [#cg_set{op=bs_put}|_] ->
+                [#cg_set{op=succeeded},#cg_set{op=bs_put}|_] ->
                     {[],N};
                 _ ->
                     %% Not binary construction. Must emit an allocation
@@ -290,13 +303,16 @@ need_heap_terminator([{_,#cg_blk{}}|_], _, N) ->
 need_heap_terminator([], _, H) ->
     {need_heap_need(H),#need{}}.
 
-need_heap_need(#need{h=0,f=0}) -> [];
+need_heap_need(#need{h=0,l=0,f=0}) -> [];
 need_heap_need(#need{}=N) -> [#cg_alloc{words=N}].
 
-add_heap_words(#need{h=H1,f=F1}, #need{h=H2,f=F2}) ->
-    #need{h=H1+H2,f=F1+F2};
+add_heap_words(#need{h=H1,l=L1,f=F1}, #need{h=H2,l=L2,f=F2}) ->
+    #need{h=H1+H2,l=L1+L2,f=F1+F2};
 add_heap_words(#need{h=Heap}=N, Words) when is_integer(Words) ->
     N#need{h=Heap+Words}.
+
+add_heap_fun(#need{h=Heap, l=Lambdas}=N, NArgs) ->
+    N#need{h=Heap+NArgs, l=Lambdas+1}.
 
 add_heap_float(#need{f=F}=N) ->
     N#need{f=F+1}.
@@ -320,7 +336,9 @@ add_heap_float(#need{f=F}=N) ->
 
 -spec classify_heap_need(beam_ssa:op(), [beam_ssa:value()]) ->
                                 'gc' | 'neutral' |
-                                {'put',non_neg_integer()} | 'put_float'.
+                                {'put',non_neg_integer()} |
+                                {'put_fun', non_neg_integer()} |
+                                'put_float'.
 
 classify_heap_need(put_list, _) ->
     {put,2};
@@ -328,6 +346,8 @@ classify_heap_need(put_tuple_arity, [#b_literal{val=Words}]) ->
     {put,Words+1};
 classify_heap_need(put_tuple, Elements) ->
     {put,length(Elements)+1};
+classify_heap_need(make_fun, Args) ->
+    {put_fun,length(Args)-1};
 classify_heap_need({bif,Name}, Args) ->
     case is_gc_bif(Name, Args) of
         false -> neutral;
@@ -365,7 +385,7 @@ classify_heap_need(bs_save) -> neutral;
 classify_heap_need(bs_get_position) -> gc;
 classify_heap_need(bs_set_position) -> neutral;
 classify_heap_need(bs_skip) -> gc;
-classify_heap_need(bs_start_match) -> neutral;
+classify_heap_need(bs_start_match) -> gc;
 classify_heap_need(bs_test_tail) -> neutral;
 classify_heap_need(bs_utf16_size) -> neutral;
 classify_heap_need(bs_utf8_size) -> neutral;
@@ -383,19 +403,22 @@ classify_heap_need(is_nonempty_list) -> neutral;
 classify_heap_need(is_tagged_tuple) -> neutral;
 classify_heap_need(kill_try_tag) -> gc;
 classify_heap_need(landingpad) -> gc;
-classify_heap_need(make_fun) -> gc;
+classify_heap_need(match_fail) -> gc;
+classify_heap_need(nop) -> neutral;
 classify_heap_need(new_try_tag) -> gc;
+classify_heap_need(old_make_fun) -> gc;
 classify_heap_need(peek_message) -> gc;
 classify_heap_need(put_map) -> gc;
 classify_heap_need(put_tuple_elements) -> neutral;
 classify_heap_need(raw_raise) -> gc;
+classify_heap_need(recv_marker_bind) -> neutral;
+classify_heap_need(recv_marker_clear) -> neutral;
+classify_heap_need(recv_marker_reserve) -> gc;
 classify_heap_need(recv_next) -> gc;
 classify_heap_need(remove_message) -> neutral;
 classify_heap_need(resume) -> gc;
 classify_heap_need(set_tuple_element) -> gc;
 classify_heap_need(succeeded) -> neutral;
-classify_heap_need(timeout) -> gc;
-classify_heap_need(wait) -> gc;
 classify_heap_need(wait_timeout) -> gc.
 
 %%%
@@ -409,44 +432,13 @@ classify_heap_need(wait_timeout) -> gc.
 %%% since the BEAM interpreter have more optimized instructions
 %%% operating on X registers than on Y registers.
 %%%
-%%% 'call' and 'make_fun' are handled somewhat specially. If a value
-%%% already is in the correct X register, the X register will always
-%%% be used instead of the Y register. However, if there are one or more
-%%% values in the wrong X registers, the X registers variables will be
-%%% used only if that does not cause more 'move' instructions to be
-%%% be emitted than if the Y register variables were used.
+%%% In call and 'call' and 'old_make_fun' instructions there is also the
+%%% possibility that a 'move' instruction can be eliminated because
+%%% a value is already in the correct X register.
 %%%
-%%% Here are some examples. The first example shows how a 'move' from
-%%% an Y register is eliminated:
-%%%
-%%%     move x0 y1
-%%%     move y1 x0   %%Will be eliminated.
-%%%
-%%%     call f/1
-%%%
-%%% Here is an example when x0 and x1 must be swapped to load the argument
-%%% registers. Here the 'call' instruction will use the Y registers to
-%%% avoid introducing an extra 'move' insruction:
-%%%
-%%%     move x0 y0
-%%%     move x1 y1
-%%%
-%%%     move y0 x1
-%%%     move y1 x0
-%%%
-%%%     call f/2
-%%%
-%%% Using the X register to load the argument registers would need
-%%% an extra 'move' instruction like this:
-%%%
-%%%     move x0 y0
-%%%     move x1 y1
-%%%
-%%%     move x1 x2
-%%%     move x0 x1
-%%%     move x2 x0
-%%%
-%%%     call f/2
+%%% Because of the new 'swap' instruction introduced in OTP 23, it
+%%% is always beneficial to prefer X register over Y registers. That
+%%% was not the case in OTP 22, which lacks the 'swap' instruction.
 %%%
 
 prefer_xregs(Linear, St) ->
@@ -476,7 +468,7 @@ prefer_xregs_successors([], _, Map) -> Map.
 
 prefer_xregs_is([#cg_alloc{}=I|Is], St, Copies0, Acc) ->
     Copies = case I of
-                 #cg_alloc{stack=none,words=#need{h=0,f=0}} ->
+                 #cg_alloc{stack=none,words=#need{h=0,l=0,f=0}} ->
                      Copies0;
                  #cg_alloc{} ->
                      #{}
@@ -492,16 +484,9 @@ prefer_xregs_is([#cg_set{op=copy,dst=Dst,args=[Src]}=I|Is], St, Copies0, Acc) ->
 prefer_xregs_is([#cg_set{op=call,dst=Dst}=I0|Is], St, Copies, Acc) ->
     I = prefer_xregs_call(I0, Copies, St),
     prefer_xregs_is(Is, St, #{Dst=>{x,0}}, [I|Acc]);
-prefer_xregs_is([#cg_set{op=make_fun,dst=Dst}=I0|Is], St, Copies, Acc) ->
+prefer_xregs_is([#cg_set{op=old_make_fun,dst=Dst}=I0|Is], St, Copies, Acc) ->
     I = prefer_xregs_call(I0, Copies, St),
     prefer_xregs_is(Is, St, #{Dst=>{x,0}}, [I|Acc]);
-prefer_xregs_is([#cg_set{op=set_tuple_element}=I|Is], St, Copies, Acc) ->
-    %% FIXME: HiPE translates the following code segment incorrectly:
-    %%     {call_ext,3,{extfunc,erlang,setelement,3}}.
-    %%     {move,{x,0},{y,3}}.
-    %%     {set_tuple_element,{y,1},{y,3},1}.
-    %% Therefore, skip the translation of the arguments for set_tuple_element.
-    prefer_xregs_is(Is, St, Copies, [I|Acc]);
 prefer_xregs_is([#cg_set{args=Args0}=I0|Is], St, Copies0, Acc) ->
     Args = [do_prefer_xreg(A, Copies0, St) || A <- Args0],
     I = I0#cg_set{args=Args},
@@ -530,60 +515,22 @@ prefer_xregs_prune(#cg_set{dst=Dst}, Copies, St) ->
     maps:filter(F, Copies).
 
 %% prefer_xregs_call(Instruction, Copies, St) -> Instruction.
-%%  Given a 'call' or 'make_fun' instruction, minimize the number
-%%  of 'move' instructions to set up the argument registers.
-%%  Prefer using X registers over Y registers, unless that will
-%%  result in more 'move' instructions.
+%%  Given a 'call' or 'old_make_fun' instruction rewrite the arguments
+%%  to use an X register instead of a Y register if a value is
+%%  is available in both.
 
-prefer_xregs_call(#cg_set{args=[_]}=I, _Copies, _St) ->
-    I;
-prefer_xregs_call(#cg_set{args=[F|Args0]}=I, Copies, St) ->
-    case Args0 of
-        [A0] ->
-            %% Only one argument. Always prefer the X register
-            %% if available.
-            A = do_prefer_xreg(A0, Copies, St),
-            I#cg_set{args=[F,A]};
-        [_|_] ->
-            %% Two or more arguments. Try rewriting arguments in
-            %% two ways and see which way produces the least
-            %% number of 'move' instructions.
-            Args1 = prefer_xregs_call_1(Args0, Copies, 0, St),
-            Args2 = [do_prefer_xreg(A, Copies, St) || A <- Args0],
-            case {count_moves(Args1, St),count_moves(Args2, St)} of
-                {N1,N2} when N1 < N2 ->
-                    %% There will be fewer 'move' instructions if
-                    %% we keep using Y registers.
-                    I#cg_set{args=[F|Args1]};
-                {_,_} ->
-                    %% Always use the values in X registers.
-                    I#cg_set{args=[F|Args2]}
-            end
-    end.
-
-count_moves(Args, St) ->
-    length(setup_args(beam_args(Args, St))).
-
-prefer_xregs_call_1([#b_var{}=A|As], Copies, X, St) ->
-    case {beam_arg(A, St),Copies} of
-        {{y,_},#{A:=Other}} ->
-            case beam_arg(Other, St) of
-                {x,X} ->
-                    %% This value is already in the correct X register.
-                    %% It is always benefical to use the X register variable.
-                    [Other|prefer_xregs_call_1(As, Copies, X+1, St)];
-                _ ->
-                    %% This value is another X register. Keep using
-                    %% the Y register variable.
-                    [A|prefer_xregs_call_1(As, Copies, X+1, St)]
-            end;
-        {_,_} ->
-            %% The value is not available in an X register.
-            [A|prefer_xregs_call_1(As, Copies, X+1, St)]
-    end;
-prefer_xregs_call_1([A|As], Copies, X, St) ->
-    [A|prefer_xregs_call_1(As, Copies, X+1, St)];
-prefer_xregs_call_1([], _, _, _) -> [].
+prefer_xregs_call(#cg_set{args=[F0|Args0]}=I, Copies, St) ->
+    F = case F0 of
+            #b_var{} ->
+                do_prefer_xreg(F0, Copies, St);
+            #b_remote{mod=Mod,name=Name} ->
+                F0#b_remote{mod=do_prefer_xreg(Mod, Copies, St),
+                            name=do_prefer_xreg(Name, Copies, St)};
+            _ ->
+                F0
+        end,
+    Args = [do_prefer_xreg(A, Copies, St) || A <- Args0],
+    I#cg_set{args=[F|Args]}.
 
 do_prefer_xreg(#b_var{}=A, Copies, St) ->
     case {beam_arg(A, St),Copies} of
@@ -629,7 +576,7 @@ liveness_get(S, LiveMap) ->
     end.
 
 liveness_successors(Terminator) ->
-    successors(Terminator) -- [?BADARG_BLOCK].
+    successors(Terminator) -- [?EXCEPTION_BLOCK].
 
 liveness_is([#cg_alloc{}=I0|Is], Regs, Live, Acc) ->
     I = I0#cg_alloc{live=num_live(Live, Regs)},
@@ -764,9 +711,8 @@ defined(Linear, #cg{regs=Regs}) ->
 
 def([{L,#cg_blk{is=Is0,last=Last}=Blk0}|Bs], DefMap0, Regs) ->
     Def0 = def_get(L, DefMap0),
-    {Is,Def} = def_is(Is0, Regs, Def0, []),
-    Successors = successors(Last),
-    DefMap = def_successors(Successors, Def, DefMap0),
+    {Is,Def,MaybeDef} = def_is(Is0, Regs, Def0, []),
+    DefMap = def_successors(Last, Def, MaybeDef, DefMap0),
     Blk = Blk0#cg_blk{is=Is},
     [{L,Blk}|def(Bs, DefMap, Regs)];
 def([], _, _) -> [].
@@ -780,6 +726,11 @@ def_get(L, DefMap) ->
 def_is([#cg_alloc{anno=Anno0}=I0|Is], Regs, Def, Acc) ->
     I = I0#cg_alloc{anno=Anno0#{def_yregs=>Def}},
     def_is(Is, Regs, Def, [I|Acc]);
+def_is([#cg_set{op=succeeded,args=[Var]}=I], Regs, Def, Acc) ->
+    %% Var will only be defined on the success branch of the `br`
+    %% for this block.
+    MaybeDef = def_add_yreg(Var, [], Regs),
+    {reverse(Acc, [I]),Def,MaybeDef};
 def_is([#cg_set{op=kill_try_tag,args=[#b_var{}=Tag]}=I|Is], Regs, Def0, Acc) ->
     Def = ordsets:del_element(Tag, Def0),
     def_is(Is, Regs, Def, [I|Acc]);
@@ -822,13 +773,19 @@ def_is([#cg_set{anno=Anno0,dst=Dst}=I0|Is], Regs, Def0, Acc) ->
     Def = def_add_yreg(Dst, Def0, Regs),
     def_is(Is, Regs, Def, [I|Acc]);
 def_is([], _, Def, Acc) ->
-    {reverse(Acc),Def}.
+    {reverse(Acc),Def,[]}.
 
 def_add_yreg(Dst, Def, Regs) ->
     case is_yreg(Dst, Regs) of
         true -> ordsets:add_element(Dst, Def);
         false -> Def
     end.
+
+def_successors(#cg_br{bool=#b_var{},succ=Succ,fail=Fail}, Def, MaybeDef, DefMap0) ->
+    DefMap = def_successors([Fail], ordsets:subtract(Def, MaybeDef), DefMap0),
+    def_successors([Succ], Def, DefMap);
+def_successors(Last, Def, [], DefMap) ->
+    def_successors(successors(Last), Def, DefMap).
 
 def_successors([S|Ss], Def0, DefMap) ->
     case DefMap of
@@ -932,6 +889,44 @@ opt_allocate_is([#cg_alloc{}|Is]) ->
     opt_allocate_is(Is);
 opt_allocate_is([]) -> none.
 
+%% fix_wait_timeout([Block]) -> [Block].
+%%  In SSA code, the `wait_timeout` instruction is a three-way branch
+%%  (because there will be an exception for a bad timeout value). In
+%%  BEAM code, the potential rasing of an exception for a bad timeout
+%%  duration is not explicitly represented. Thus we will need to
+%%  rewrite the following code:
+%%
+%%       WaitBool = wait_timeout TimeoutValue
+%%       Succeeded = succeeded:body WaitBool
+%%       br Succeeded, ^good_timeout_value, ^bad_timeout_value
+%%
+%%   good_timeout_value:
+%%       br WaitBool, ^timeout_expired, ^new_message_received
+%%
+%%  To this code:
+%%
+%%       WaitBool = wait_timeout TimeoutValue
+%%       br WaitBool, ^timeout_expired, ^new_message_received
+%%
+fix_wait_timeout([{L1,#cg_blk{is=Is0,last=#cg_br{bool=#b_var{},succ=L2}}=Blk1},
+                  {L2,#cg_blk{is=[],last=#cg_br{}=Br}=Blk2}|Bs]) ->
+    case fix_wait_timeout_is(Is0, []) of
+        no ->
+            [{L1,Blk1},{L2,Blk2}|fix_wait_timeout(Bs)];
+        {yes,Is} ->
+            [{L1,Blk1#cg_blk{is=Is,last=Br}}|fix_wait_timeout(Bs)]
+    end;
+fix_wait_timeout([B|Bs]) ->
+    [B|fix_wait_timeout(Bs)];
+fix_wait_timeout([]) -> [].
+
+fix_wait_timeout_is([#cg_set{op=wait_timeout,dst=WaitBool}=WT,
+                     #cg_set{op=succeeded,args=[WaitBool]}], Acc) ->
+    {yes,reverse(Acc, [WT])};
+fix_wait_timeout_is([I|Is], Acc) ->
+    fix_wait_timeout_is(Is, [I|Acc]);
+fix_wait_timeout_is([], _Acc) -> no.
+
 %%%
 %%% Here follows the main code generation functions.
 %%%
@@ -939,12 +934,22 @@ opt_allocate_is([]) -> none.
 %% cg_linear([{BlockLabel,Block}]) -> [BeamInstruction].
 %%  Generate BEAM instructions.
 
-cg_linear([{L,#cg_blk{anno=#{recv_set:=L}=Anno0}=B0}|Bs], St0) ->
-    Anno = maps:remove(recv_set, Anno0),
-    B = B0#cg_blk{anno=Anno},
-    {Is,St1} = cg_linear([{L,B}|Bs], St0),
-    {Fail,St} = use_block_label(L, St1),
-    {[{recv_set,Fail}|Is],St};
+cg_linear([{L, #cg_blk{is=[#cg_set{op=peek_message,
+                                   args=[Marker]}=Peek | Is0]}=B0} | Bs],
+          St0)->
+    B = B0#cg_blk{is=[Peek#cg_set{args=[]} | Is0]},
+    {Is, St} = cg_linear([{L, B} | Bs], St0),
+    case Marker of
+        #b_literal{val=Val} ->
+            none = Val,                         %Assertion.
+            {Is, St};
+        _ ->
+            %% We never jump directly into receive loops so we can be certain
+            %% that recv_marker_use/1 is always executed despite preceding
+            %% the loop label. This is verified by the validator.
+            Reg = beam_arg(Marker, St0),
+            {[{recv_marker_use, Reg} | Is], St}
+    end;
 cg_linear([{L,#cg_blk{is=Is0,last=Last}}|Bs], St0) ->
     Next = next_block(Bs),
     St1 = new_block_label(L, St0),
@@ -956,13 +961,24 @@ cg_linear([], St) -> {[],St}.
 cg_block([#cg_set{op=recv_next}], #cg_br{succ=Lr0}, _Next, St0) ->
     {Lr,St} = use_block_label(Lr0, St0),
     {[{loop_rec_end,Lr}],St};
-cg_block([#cg_set{op=wait}], #cg_br{succ=Lr0}, _Next, St0) ->
+cg_block([#cg_set{op=wait_timeout,
+                  args=[#b_literal{val=infinity}]}],
+         Last, _Next, St0) ->
+    %% 'infinity' will never time out, so we'll simplify this to a 'wait'
+    %% instruction that always jumps back to peek_message (fail label).
+    #cg_br{fail=Lr0} = Last,
     {Lr,St} = use_block_label(Lr0, St0),
     {[{wait,Lr}],St};
 cg_block(Is0, Last, Next, St0) ->
     case Last of
         #cg_br{succ=Next,fail=Next} ->
             cg_block(Is0, none, St0);
+        #cg_br{succ=Same,fail=Same} when Same =:= ?EXCEPTION_BLOCK ->
+            %% An expression in this block *always* throws an exception, so we
+            %% terminate it with an 'if_end' to make sure the validator knows
+            %% that the following instructions won't actually be reached.
+            {Is,St} = cg_block(Is0, none, St0),
+            {Is++[if_end],St};
         #cg_br{succ=Same,fail=Same} ->
             {Fail,St1} = use_block_label(Same, St0),
             {Is,St} = cg_block(Is0, none, St1),
@@ -1016,18 +1032,20 @@ bif_fail({catch_tag,_}) -> {f,0}.
 next_block([]) -> none;
 next_block([{Next,_}|_]) -> Next.
 
+%% Certain instructions (such as get_map_element or is_nonempty_list)
+%% are only used in guards and **must** have a non-zero label;
+%% otherwise, the loader will refuse to load the
+%% module. ensure_label/2 replaces a zero label with the "ultimate
+%% failure" label to make the module loadable.  The instruction that
+%% have had the zero label replaced is **not** supposed to ever fail
+%% and actually jump to the label.
+
 ensure_label(Fail0, #cg{ultimate_fail=Lbl}) ->
     case bif_fail(Fail0) of
         {f,0} -> {f,Lbl};
         {f,_}=Fail -> Fail
     end.
 
-cg_block([#cg_set{anno=#{recv_mark:=L}=Anno0}=I0|T], Context, St0) ->
-    Anno = maps:remove(recv_mark, Anno0),
-    I = I0#cg_set{anno=Anno},
-    {Is,St1} = cg_block([I|T], Context, St0),
-    {Fail,St} = use_block_label(L, St1),
-    {[{recv_mark,Fail}|Is],St};
 cg_block([#cg_set{op=new_try_tag,dst=Tag,args=Args}], {Tag,Fail0}, St) ->
     {catch_tag,Fail} = Fail0,
     [Reg,{atom,Kind}] = beam_args([Tag|Args], St),
@@ -1101,24 +1119,28 @@ cg_block([#cg_set{op=bs_init,dst=Dst0,args=Args0,anno=Anno}=I,
     Line = line(Anno),
     Alloc = map_get(alloc, Anno),
     [#b_literal{val=Kind}|Args1] = Args0,
+    Live = get_live(I),
     case Kind of
         new ->
             [Dst,Size,{integer,Unit}] = beam_args([Dst0|Args1], St),
-            Live = get_live(I),
             {[Line|cg_bs_init(Dst, Size, Alloc, Unit, Live, Fail)],St};
         private_append ->
             [Dst,Src,Bits,{integer,Unit}] = beam_args([Dst0|Args1], St),
             Flags = {field_flags,[]},
-            Is = [Line,{bs_private_append,Fail,Bits,Unit,Src,Flags,Dst}],
+            TestHeap = {test_heap,Alloc,Live},
+            BsPrivateAppend = {bs_private_append,Fail,Bits,Unit,Src,Flags,Dst},
+            Is = [TestHeap,Line,BsPrivateAppend],
             {Is,St};
         append ->
             [Dst,Src,Bits,{integer,Unit}] = beam_args([Dst0|Args1], St),
             Flags = {field_flags,[]},
-            Live = get_live(I),
             Is = [Line,{bs_append,Fail,Bits,Alloc,Live,Unit,Src,Flags,Dst}],
             {Is,St}
     end;
-cg_block([#cg_set{anno=Anno,op=bs_start_match,dst=Ctx0,args=[Bin0]}=I,
+cg_block([#cg_set{anno=Anno,
+                  op=bs_start_match,
+                  dst=Ctx0,
+                  args=[#b_literal{val=new},Bin0]}=I,
           #cg_set{op=succeeded,dst=Bool}], {Bool,Fail}, St) ->
     [Dst,Bin1] = beam_args([Ctx0,Bin0], St),
     {Bin,Pre} = force_reg(Bin1, Dst),
@@ -1135,11 +1157,22 @@ cg_block([#cg_set{anno=Anno,op=bs_start_match,dst=Ctx0,args=[Bin0]}=I,
 cg_block([#cg_set{op=bs_get}=Set,
           #cg_set{op=succeeded,dst=Bool}], {Bool,Fail}, St) ->
     {cg_bs_get(Fail, Set, St),St};
-cg_block([#cg_set{op=bs_match_string,args=[CtxVar,#b_literal{val=String}]},
+cg_block([#cg_set{op=bs_match_string,args=[CtxVar,#b_literal{val=String0}]},
           #cg_set{op=succeeded,dst=Bool}], {Bool,Fail}, St) ->
     CtxReg = beam_arg(CtxVar, St),
-    Is = [{test,bs_match_string,Fail,[CtxReg,String]}],
+
+    Bits = bit_size(String0),
+    String = case Bits rem 8 of
+                 0 -> String0;
+                 Rem -> <<String0/bitstring,0:(8-Rem)>>
+             end,
+
+    Is = [{test,bs_match_string,Fail,[CtxReg,Bits,{string,String}]}],
     {Is,St};
+cg_block([#cg_set{op=bs_put,args=Args0},
+          #cg_set{op=succeeded,dst=Bool}], {Bool,Fail}, St) ->
+    Args = beam_args(Args0, St),
+    {cg_bs_put(bif_fail(Fail), Args),St};
 cg_block([#cg_set{dst=Dst0,op=landingpad,args=Args0}|T], Context, St0) ->
     [Dst,{atom,Kind},Tag] = beam_args([Dst0|Args0], St0),
     case Kind of
@@ -1160,27 +1193,39 @@ cg_block([#cg_set{op=call}=I,
           #cg_set{op=succeeded,dst=Bool}], {Bool,_Fail}, St) ->
     %% A call in try/catch block.
     cg_block([I], none, St);
+cg_block([#cg_set{op=match_fail}=I,
+          #cg_set{op=succeeded,dst=Bool}], {Bool,_Fail}, St) ->
+    %% A match_fail instruction in a try/catch block.
+    cg_block([I], none, St);
+cg_block([#cg_set{op=get_map_element,dst=Dst0,args=Args0},
+          #cg_set{op=succeeded,dst=Bool}], {Bool,Fail0}, St) ->
+    [Dst,Map,Key] = beam_args([Dst0|Args0], St),
+    Fail = ensure_label(Fail0, St),
+    {[{get_map_elements,Fail,Map,{list,[Key,Dst]}}],St};
 cg_block([#cg_set{op=Op,dst=Dst0,args=Args0}=I,
           #cg_set{op=succeeded,dst=Bool}], {Bool,Fail}, St) ->
     [Dst|Args] = beam_args([Dst0|Args0], St),
     {cg_test(Op, bif_fail(Fail), Args, Dst, I),St};
-cg_block([#cg_set{op=bs_put,dst=Bool,args=Args0}], {Bool,Fail}, St) ->
-    Args = beam_args(Args0, St),
-    {cg_bs_put(bif_fail(Fail), Args),St};
 cg_block([#cg_set{op=bs_test_tail,dst=Bool,args=Args0}], {Bool,Fail}, St) ->
     [Ctx,{integer,Bits}] = beam_args(Args0, St),
     {[{test,bs_test_tail2,bif_fail(Fail),[Ctx,Bits]}],St};
-cg_block([#cg_set{op={float,checkerror},dst=Bool}], {Bool,Fail}, St) ->
-    {[{fcheckerror,bif_fail(Fail)}],St};
 cg_block([#cg_set{op=is_tagged_tuple,dst=Bool,args=Args0}], {Bool,Fail}, St) ->
     [Src,{integer,Arity},Tag] = beam_args(Args0, St),
     {[{test,is_tagged_tuple,ensure_label(Fail, St),[Src,Arity,Tag]}],St};
 cg_block([#cg_set{op=is_nonempty_list,dst=Bool,args=Args0}], {Bool,Fail}, St) ->
     Args = beam_args(Args0, St),
     {[{test,is_nonempty_list,ensure_label(Fail, St),Args}],St};
-cg_block([#cg_set{op=has_map_field,dst=Bool,args=Args0}], {Bool,Fail}, St) ->
-    [Src,Key] = beam_args(Args0, St),
-    {[{test,has_map_fields,Fail,Src,{list,[Key]}}],St};
+cg_block([#cg_set{op=has_map_field,dst=Dst0,args=Args0}], {Dst0,Fail0}, St) ->
+    Fail = ensure_label(Fail0, St),
+    case beam_args([Dst0|Args0], St) of
+        [{z,0},Src,Key] ->
+            {[{test,has_map_fields,Fail,Src,{list,[Key]}}],St};
+        [Dst,Src,Key] ->
+            %% The result is used more than once. Must rewrite to bif:is_map_key
+            %% to set the destination register.
+            {[{bif,is_map_key,Fail0,[Key,Src],Dst},
+              {test,is_eq_exact,Fail,[Dst,{atom,true}]}],St}
+    end;
 cg_block([#cg_set{op=call}=Call], {_Bool,_Fail}=Context, St0) ->
     {Is0,St1} = cg_call(Call, body, none, St0),
     {Is1,St} = cg_block([], Context, St1),
@@ -1197,15 +1242,30 @@ cg_block([#cg_set{op=call}=Call|T], Context, St0) ->
     {Is0,St1} = cg_call(Call, body, none, St0),
     {Is1,St} = cg_block(T, Context, St1),
     {Is0++Is1,St};
-cg_block([#cg_set{op=make_fun,dst=Dst0,args=[Local|Args0]}|T],
-         Context, St0) ->
+cg_block([#cg_set{anno=Anno,op=MakeFun,dst=Dst0,args=[Local|Args0]}|T],
+         Context, St0) when MakeFun =:= make_fun;
+                            MakeFun =:= old_make_fun ->
     #b_local{name=#b_literal{val=Func},arity=Arity} = Local,
     [Dst|Args] = beam_args([Dst0|Args0], St0),
     {FuncLbl,St1} = local_func_label(Func, Arity, St0),
-    Is0 = setup_args(Args) ++
-        [{make_fun2,{f,FuncLbl},0,0,length(Args)}|copy({x,0}, Dst)],
-    {Is1,St} = cg_block(T, Context, St1),
-    {Is0++Is1,St};
+    Is0 = case MakeFun of
+              make_fun ->
+                  [{make_fun3,{f,FuncLbl},0,0,Dst,{list,Args}}];
+              old_make_fun ->
+                  setup_args(Args) ++
+                      [{make_fun2,{f,FuncLbl},0,0,length(Args)}
+                       | copy({x,0}, Dst)]
+          end,
+    Is1 = case Anno of
+             #{ result_type := Type } ->
+                 Info = {var_info, Dst, [{fun_type, Type}]},
+                 Is0 ++ [{'%', Info}];
+             #{} ->
+                 Is0
+          end,
+
+    {Is2,St} = cg_block(T, Context, St1),
+    {Is1++Is2,St};
 cg_block([#cg_set{op=copy}|_]=T0, Context, St0) ->
     {Is0,T} = cg_copy(T0, St0),
     {Is1,St} = cg_block(T, Context, St0),
@@ -1216,6 +1276,37 @@ cg_block([#cg_set{op=copy}|_]=T0, Context, St0) ->
         no ->
             {Is,St}
     end;
+cg_block([#cg_set{op=match_fail,args=Args0,anno=Anno}], none, St) ->
+    Args = beam_args(Args0, St),
+    Is = cg_match_fail(Args, line(Anno), none),
+    {Is,St};
+cg_block([#cg_set{op=match_fail,args=Args0,anno=Anno}|T], Context, St0) ->
+    FcLabel = case Context of
+                  {return,_,none} ->
+                      %% There is no stack frame. If this is a function_clause
+                      %% exception, it is safe to jump to the label of the
+                      %% func_info instruction.
+                      St0#cg.fc_label;
+                  _ ->
+                      %% This is most probably not a function_clause.
+                      %% If this is a function_clause exception
+                      %% (rare), it is not safe to jump to the
+                      %% func_info label.
+                      none
+              end,
+    Args = beam_args(Args0, St0),
+    Is0 = cg_match_fail(Args, line(Anno), FcLabel),
+    {Is1,St} = cg_block(T, Context, St0),
+    {Is0++Is1,St};
+cg_block([#cg_set{op=wait_timeout,dst=Bool,args=Args0}], {Bool,Fail}, St) ->
+    Is = case beam_args(Args0, St) of
+             [{integer,0}] ->
+                 [timeout];
+             [Timeout] ->
+                 true = Timeout =/= {atom,infinity},
+                 [{wait_timeout,Fail,Timeout},timeout]
+         end,
+    {Is,St};
 cg_block([#cg_set{op=Op,dst=Dst0,args=Args0}=Set], none, St) ->
     [Dst|Args] = beam_args([Dst0|Args0], St),
     Is = cg_instr(Op, Args, Dst, Set),
@@ -1247,8 +1338,7 @@ cg_copy(T0, St) ->
                            end, T0),
     Moves0 = cg_copy_1(Copies, St),
     Moves1 = [Move || {move,Src,Dst}=Move <- Moves0, Src =/= Dst],
-    Scratch = {x,1022},
-    Moves = order_moves(Moves1, Scratch),
+    Moves = order_moves(Moves1),
     {Moves,T}.
 
 cg_copy_1([#cg_set{dst=Dst0,args=Args}|T], St) ->
@@ -1342,39 +1432,38 @@ bif_to_test_1('=/=', [_,_]=Ops, Fail) ->
 
 opt_call_moves(Is0, Arity) ->
     {Moves0,Is} = splitwith(fun({move,_,_}) -> true;
-                               ({kill,_}) -> true;
+                               ({init_yregs,_}) -> true;
                                (_) -> false
                             end, Is0),
     Moves = opt_call_moves_1(Moves0, Arity),
     Moves ++ Is.
 
-opt_call_moves_1([{move,Src,{x,_}=Tmp}=M1|[{kill,_}|_]=Is], Arity) ->
+opt_call_moves_1([{move,Src,{x,_}=Tmp}=M1,
+                  {init_yregs,{list,Yregs}}=Init|Is], Arity) ->
     %% There could be a {move,Tmp,{x,0}} instruction after the
-    %% kill/1 instructions (moved to there by opt_move_to_x0/1).
-    case splitwith(fun({kill,_}) -> true;
-                      (_) -> false
-                   end, Is) of
-        {Kills,[{move,{x,_}=Tmp,{x,0}}=M2]} ->
+    %% init_yreg/1 instruction (moved to there by opt_move_to_x0/1).
+    case Is of
+        [{move,{x,_}=Tmp,{x,0}}=M2] ->
             %% The two move/2 instructions (M1 and M2) can be combined
             %% to one. The question is, though, is it safe to place
             %% them after the kill/1 instructions?
-            case is_killed(Src, Kills, Arity) of
+            case member(Src, Yregs) of
                 true ->
-                    %% Src (a Y register) is killed by one of the
-                    %% kill/1 instructions. Thus M1 and M2
-                    %% must be placed before the kill/1 instructions
-                    %% (essentially undoing what opt_move_to_x0/1
-                    %% did, which turned out to be a pessimization
-                    %% in this case).
-                    opt_call_moves_1([M1,M2|Kills], Arity);
+                    %% Src (a Y register) is killed by the
+                    %% init_yregs/1 instruction. Thus M1 and M2 must
+                    %% be placed before the kill/1 instructions
+                    %% (essentially undoing what opt_move_to_x0/1 did,
+                    %% which turned out to be a pessimization in this
+                    %% case).
+                    opt_call_moves_1([M1,M2,Init], Arity);
                 false ->
-                    %% Src is not killed by any of the kill/1
+                    %% Src is not killed by the init_yregs/1
                     %% instructions. Thus it is safe to place
                     %% M1 and M2 after the kill/1 instructions.
-                    opt_call_moves_1(Kills++[M1,M2], Arity)
+                    opt_call_moves_1([Init,M1,M2], Arity)
             end;
-        {_,_} ->
-            [M1|Is]
+        _ ->
+            [M1,Init|Is]
     end;
 opt_call_moves_1([{move,Src,{x,_}=Tmp}=M1,{move,Tmp,Dst}=M2|Is], Arity) ->
     case is_killed(Tmp, Is, Arity) of
@@ -1389,22 +1478,18 @@ opt_call_moves_1([M|Ms], Arity) ->
     [M|opt_call_moves_1(Ms, Arity)];
 opt_call_moves_1([], _Arity) -> [].
 
-is_killed(Y, [{kill,Y}|_], _) ->
-    true;
-is_killed(R, [{kill,_}|Is], Arity) ->
-    is_killed(R, Is, Arity);
 is_killed(R, [{move,R,_}|_], _) ->
     false;
 is_killed(R, [{move,_,R}|_], _) ->
     true;
 is_killed(R, [{move,_,_}|Is], Arity) ->
     is_killed(R, Is, Arity);
+is_killed({x,_}=R, [{init_yregs,_}|Is], Arity) ->
+    is_killed(R, Is, Arity);
 is_killed({x,X}, [], Arity) ->
-    X >= Arity;
-is_killed({y,_}, [], _) ->
-    false.
+    X >= Arity.
 
-cg_alloc(#cg_alloc{stack=none,words=#need{h=0,f=0}}, _St) ->
+cg_alloc(#cg_alloc{stack=none,words=#need{h=0,l=0,f=0}}, _St) ->
     [];
 cg_alloc(#cg_alloc{stack=none,words=Need,live=Live}, _St) ->
     [{test_heap,alloc(Need),Live}];
@@ -1414,28 +1499,26 @@ cg_alloc(#cg_alloc{stack=Stk,words=Need,live=Live,def_yregs=DefYregs},
     All = [{y,Y} || Y <- lists:seq(0, Stk-1)],
     Def = ordsets:from_list([maps:get(V, Regs) || V <- DefYregs]),
     NeedInit = ordsets:subtract(All, Def),
-    NoZero = length(Def)*2 > Stk,
-    I = case {NoZero,Alloc} of
-            {true,0} -> {allocate,Stk,Live};
-            {true,_} -> {allocate_heap,Stk,Alloc,Live};
-            {false,0} -> {allocate_zero,Stk,Live};
-            {false,_} -> {allocate_heap_zero,Stk,Alloc,Live}
+    I = case Alloc of
+            0 -> {allocate,Stk,Live};
+            _ -> {allocate_heap,Stk,Alloc,Live}
         end,
-    [I|case NoZero of
-           true -> [{init,Y} || Y <- NeedInit];
-           false -> []
-       end].
+    [I|init_yregs(NeedInit)].
 
-alloc(#need{h=Words,f=0}) ->
+init_yregs([_|_]=Yregs) ->
+    [{init_yregs,{list,Yregs}}];
+init_yregs([]) -> [].
+
+alloc(#need{h=Words,l=0,f=0}) ->
     Words;
-alloc(#need{h=Words,f=Floats}) ->
-    {alloc,[{words,Words},{floats,Floats}]}.
+alloc(#need{h=Words,l=Lambdas,f=Floats}) ->
+    {alloc,[{words,Words},{floats,Floats},{funs,Lambdas}]}.
 
 is_call([#cg_set{op=call,args=[#b_var{}|Args]}|_]) ->
     {yes,1+length(Args)};
 is_call([#cg_set{op=call,args=[_|Args]}|_]) ->
     {yes,length(Args)};
-is_call([#cg_set{op=make_fun,args=[_|Args]}|_]) ->
+is_call([#cg_set{op=old_make_fun,args=[_|Args]}|_]) ->
     {yes,length(Args)};
 is_call(_) ->
     no.
@@ -1450,8 +1533,9 @@ cg_call(#cg_set{anno=Anno,op=call,dst=Dst0,args=[#b_local{}=Func0|Args0]},
     Call = build_call(call, Arity, {f,FuncLbl}, Context, Dst),
     Is = setup_args(Args, Anno, Context, St) ++ Line ++ Call,
     case Anno of
-        #{ result_type := Info } ->
-            {Is ++ [{'%', {type_info, Dst, Info}}], St};
+        #{ result_type := Type } ->
+            Info = {var_info, Dst, [{type,Type}]},
+            {Is ++ [{'%', Info}], St};
         #{} ->
             {Is, St}
     end;
@@ -1487,7 +1571,49 @@ cg_call(#cg_set{anno=Anno,op=call,dst=Dst0,args=Args0},
     Arity = length(Args),
     Call = build_call(call_fun, Arity, Func, Context, Dst),
     Is = setup_args(Args++[Func], Anno, Context, St) ++ Line ++ Call,
-    {Is,St}.
+    case Anno of
+        #{ result_type := Type } ->
+            Info = {var_info, Dst, [{type,Type}]},
+            {Is ++ [{'%', Info}], St};
+        #{} ->
+            {Is, St}
+    end.
+
+cg_match_fail([{atom,function_clause}|Args], Line, Fc) ->
+    case Fc of
+        none ->
+            %% There is a stack frame (probably because of inlining).
+            %% Jumping to the func_info label is not allowed by
+            %% beam_validator. Rewrite the instruction as a call to
+            %% erlang:error/2.
+            make_fc(Args, Line);
+        _ ->
+            setup_args(Args) ++ [{jump,{f,Fc}}]
+    end;
+cg_match_fail([{atom,Op}], Line, _Fc) ->
+    [Line,Op];
+cg_match_fail([{atom,Op},Val], Line, _Fc) ->
+    [Line,{Op,Val}].
+
+make_fc(Args, Line) ->
+    %% Recreate the original call to erlang:error/2.
+    Live = foldl(fun({x,X}, A) -> max(X+1, A);
+                    (_, A) -> A
+                 end, 0, Args),
+    TmpReg = {x,Live},
+    StkMoves = build_stk(reverse(Args), TmpReg, nil),
+    [{test_heap,2*length(Args),Live}|StkMoves] ++
+        [{move,{atom,function_clause},{x,0}},
+         Line,
+         {call_ext,2,{extfunc,erlang,error,2}}].
+
+build_stk([V], _TmpReg, Tail) ->
+    [{put_list,V,Tail,{x,1}}];
+build_stk([V|Vs], TmpReg, Tail) ->
+    I = {put_list,V,Tail,TmpReg},
+    [I|build_stk(Vs, TmpReg, TmpReg)];
+build_stk([], _TmpReg, nil) ->
+    [{move,nil,{x,1}}].
 
 build_call(call_fun, Arity, _Func, none, Dst) ->
     [{call_fun,Arity}|copy({x,0}, Dst)];
@@ -1527,15 +1653,22 @@ build_apply(Arity, {return,Val,N}, _Dst) when is_integer(N) ->
 build_apply(Arity, none, Dst) ->
     [{apply,Arity}|copy({x,0}, Dst)].
 
-cg_instr(put_map, [{atom,assoc},SrcMap|Ss], Dst, Set) ->
+cg_instr(bs_start_match, [{atom,resume}, Src], Dst, Set) ->
     Live = get_live(Set),
-    [{put_map_assoc,{f,0},SrcMap,Dst,Live,{list,Ss}}];
+    [{bs_start_match4,{atom,resume},Live,Src,Dst}];
+cg_instr(bs_start_match, [{atom,new}, Src0], Dst, Set) ->
+    {Src, Pre} = force_reg(Src0, Dst),
+    Live = get_live(Set),
+    Pre ++ [{bs_start_match4,{atom,no_fail},Live,Src,Dst}];
 cg_instr(bs_get_tail, [Src], Dst, Set) ->
     Live = get_live(Set),
     [{bs_get_tail,Src,Dst,Live}];
 cg_instr(bs_get_position, [Ctx], Dst, Set) ->
     Live = get_live(Set),
     [{bs_get_position,Ctx,Dst,Live}];
+cg_instr(put_map, [{atom,assoc},SrcMap|Ss], Dst, Set) ->
+    Live = get_live(Set),
+    [{put_map_assoc,{f,0},SrcMap,Dst,Live,{list,Ss}}];
 cg_instr(Op, Args, Dst, _Set) ->
     cg_instr(Op, Args, Dst).
 
@@ -1557,8 +1690,6 @@ cg_instr(build_stacktrace, Args, Dst) ->
     setup_args(Args) ++ [build_stacktrace|copy({x,0}, Dst)];
 cg_instr(set_tuple_element=Op, [New,Tuple,{integer,Index}], _Dst) ->
     [{Op,New,Tuple,Index}];
-cg_instr({float,clearerror}, [], _Dst) ->
-    [fclearerror];
 cg_instr({float,get}, [Src], Dst) ->
     [{fmove,Src,Dst}];
 cg_instr({float,put}, [Src], Dst) ->
@@ -1569,8 +1700,12 @@ cg_instr(get_tl=Op, [Src], Dst) ->
     [{Op,Src,Dst}];
 cg_instr(get_tuple_element=Op, [Src,{integer,N}], Dst) ->
     [{Op,Src,N,Dst}];
+cg_instr(has_map_field, [Map,Key], Dst) ->
+    [{bif,is_map_key,{f,0},[Key,Map],Dst}];
 cg_instr(put_list=Op, [Hd,Tl], Dst) ->
     [{Op,Hd,Tl,Dst}];
+cg_instr(nop, [], _Dst) ->
+    [];
 cg_instr(put_tuple, Elements, Dst) ->
     [{put_tuple2,Dst,{list,Elements}}];
 cg_instr(put_tuple_arity, [{integer,Arity}], Dst) ->
@@ -1579,12 +1714,16 @@ cg_instr(put_tuple_elements, Elements, _Dst) ->
     [{put,E} || E <- Elements];
 cg_instr(raw_raise, Args, Dst) ->
     setup_args(Args) ++ [raw_raise|copy({x,0}, Dst)];
+cg_instr(recv_marker_bind, [Mark, Ref], _Dst) ->
+    [{recv_marker_bind, Mark, Ref}];
+cg_instr(recv_marker_clear, [Src], _Dst) ->
+    [{recv_marker_clear, Src}];
+cg_instr(recv_marker_reserve, [], Dst) ->
+    [{recv_marker_reserve, Dst}];
 cg_instr(remove_message, [], _Dst) ->
     [remove_message];
 cg_instr(resume, [A,B], _Dst) ->
-    [{bif,raise,{f,0},[A,B],{x,0}}];
-cg_instr(timeout, [], _Dst) ->
-    [timeout].
+    [{bif,raise,{f,0},[A,B],{x,0}}].
 
 cg_test(bs_add=Op, Fail, [Src1,Src2,{integer,Unit}], Dst, _I) ->
     [{Op,Fail,[Src1,Src2,Unit],Dst}];
@@ -1594,9 +1733,9 @@ cg_test(bs_utf8_size=Op, Fail, [Src], Dst, _I) ->
     [{Op,Fail,Src,Dst}];
 cg_test(bs_utf16_size=Op, Fail, [Src], Dst, _I) ->
     [{Op,Fail,Src,Dst}];
-cg_test({float,convert}, Fail, [Src], Dst, _I) ->
+cg_test({float,convert}, Fail, [Src], Dst, #cg_set{anno=Anno}) ->
     {f,0} = Fail,                               %Assertion.
-    [{fconv,Src,Dst}];
+    [line(Anno),{fconv,Src,Dst}];
 cg_test({float,Op0}, Fail, Args, Dst, #cg_set{anno=Anno}) ->
     Op = case Op0 of
              '+' -> fadd;
@@ -1606,20 +1745,11 @@ cg_test({float,Op0}, Fail, Args, Dst, #cg_set{anno=Anno}) ->
              '/' -> fdiv
          end,
     [line(Anno),{bif,Op,Fail,Args,Dst}];
-cg_test(get_map_element, Fail, [Map,Key], Dst, _I) ->
-    [{get_map_elements,Fail,Map,{list,[Key,Dst]}}];
 cg_test(peek_message, Fail, [], Dst, _I) ->
     [{loop_rec,Fail,{x,0}}|copy({x,0}, Dst)];
-cg_test(put_map, Fail, [{atom,exact},SrcMap|Ss], Dst, Set) ->
+cg_test(put_map, Fail, [{atom,exact},SrcMap|Ss], Dst, #cg_set{anno=Anno}=Set) ->
     Live = get_live(Set),
-    [{put_map_exact,Fail,SrcMap,Dst,Live,{list,Ss}}];
-cg_test(wait_timeout, Fail, [Timeout], _Dst, _) ->
-    case Timeout of
-        {atom,infinity} ->
-            [{wait,Fail}];
-        _ ->
-            [{wait_timeout,Fail,Timeout}]
-    end.
+    [line(Anno),{put_map_exact,Fail,SrcMap,Dst,Live,{list,Ss}}].
 
 cg_bs_get(Fail, #cg_set{dst=Dst0,args=[#b_literal{val=Type}|Ss0]}=Set, St) ->
     Op = case Type of
@@ -1707,7 +1837,7 @@ cg_catch(Agg, T0, Context, St0) ->
 
 cg_try(Agg, Tag, T0, Context, St0) ->
     {Moves0,T1} = cg_extract(T0, Agg, St0),
-    Moves = order_moves(Moves0, {x,3}),
+    Moves = order_moves(Moves0),
     [#cg_set{op=kill_try_tag}|T2] = T1,
     {T,St} = cg_block(T2, Context, St0),
     {[{try_case,Tag}|Moves++T],St}.
@@ -1759,7 +1889,7 @@ linearize(Blocks) ->
     Linear = beam_ssa:linearize(Blocks),
     linearize_1(Linear, Blocks).
 
-linearize_1([{?BADARG_BLOCK,_}|Ls], Blocks) ->
+linearize_1([{?EXCEPTION_BLOCK,_}|Ls], Blocks) ->
     linearize_1(Ls, Blocks);
 linearize_1([{L,Block0}|Ls], Blocks) ->
     Block = translate_block(L, Block0, Blocks),
@@ -1801,8 +1931,6 @@ translate_terminator(#b_ret{anno=Anno,arg=Arg}) ->
     #cg_ret{arg=Arg,dealloc=Dealloc};
 translate_terminator(#b_br{bool=#b_literal{val=true},succ=Succ}) ->
     #cg_br{bool=#b_literal{val=true},succ=Succ,fail=Succ};
-translate_terminator(#b_br{bool=#b_literal{val=false},fail=Fail}) ->
-    #cg_br{bool=#b_literal{val=true},succ=Fail,fail=Fail};
 translate_terminator(#b_br{bool=Bool,succ=Succ,fail=Fail}) ->
     #cg_br{bool=Bool,succ=Succ,fail=Fail};
 translate_terminator(#b_switch{arg=Bool,fail=Fail,list=List}) ->
@@ -1813,7 +1941,28 @@ translate_phis(L, #cg_br{succ=Target,fail=Target}, Blocks) ->
     Phis = takewhile(fun(#b_set{op=phi}) -> true;
                         (#b_set{}) -> false
                      end, Is),
-    phi_copies(Phis, L);
+    case Phis of
+        [] ->
+            [];
+        [#b_set{op=phi,dst=NopDst}|_]=Phis ->
+            %% In rare cases (so far only seen in unoptimized code),
+            %% copy instructions can be combined like this:
+            %%
+            %%     y0/yreg_0 = copy x0/xreg_0
+            %%     x0/xreg_1 = copy y0/yreg_0
+            %%
+            %% This will result in a swap instruction instead of
+            %% two move instructions. To avoid that, insert a
+            %% dummy instruction before the copy instructions
+            %% resulting from the phi node:
+            %%
+            %%     y0/yreg_0 = copy x0/xreg_0
+            %%     _ = nop
+            %%     x0/xreg_1 = copy y0/yreg_0
+            %%
+            Nop = #cg_set{op=nop,dst=NopDst,args=[]},
+            [Nop|phi_copies(Phis, L)]
+    end;
 translate_phis(_, _, _) -> [].
 
 phi_copies([#b_set{dst=Dst,args=PhiArgs}|Sets], L) ->
@@ -1838,10 +1987,11 @@ opt_move_to_x0([I|Is], Acc) ->
     opt_move_to_x0(Is, [I|Acc]);
 opt_move_to_x0([], Acc) -> reverse(Acc).
 
-move_past_kill([{kill,Src}|_], {move,Src,_}, _) ->
-    impossible;
-move_past_kill([{kill,_}=I|Is], Move, Acc) ->
-    move_past_kill(Is, Move, [I|Acc]);
+move_past_kill([{init_yregs,{list,Yregs}}=I|Is], {move,Src,_}=Move, Acc) ->
+    case member(Src, Yregs) of
+        true -> impossible;
+        false -> move_past_kill(Is, Move, [I|Acc])
+    end;
 move_past_kill(Is, Move, Acc) ->
     {Is,[Move|Acc]}.
 
@@ -1863,14 +2013,16 @@ setup_args([]) ->
     [];
 setup_args([_|_]=Args) ->
     Moves = gen_moves(Args, 0, []),
-    Scratch = {x,1+last(sort([length(Args)-1|[X || {x,X} <- Args]]))},
-    order_moves(Moves, Scratch).
+    order_moves(Moves).
 
-%% kill_yregs(Anno, #cg{}) -> [{kill,{y,Y}}].
+%% kill_yregs(Anno, #cg{}) -> [{init_yregs,{list,[{y,Y}]}}].
 %%  Kill Y registers that will not be used again.
 
 kill_yregs(#{kill_yregs:=Kill}, #cg{regs=Regs}) ->
-    ordsets:from_list([{kill,maps:get(V, Regs)} || V <- Kill]);
+    case ordsets:from_list([map_get(V, Regs) || V <- Kill]) of
+        [] -> [];
+        [_|_]=List -> [{init_yregs,{list,List}}]
+    end;
 kill_yregs(#{}, #cg{}) -> [].
 
 %% gen_moves(As, I, Acc)
@@ -1884,47 +2036,48 @@ gen_moves([A|As], I, Acc) ->
 gen_moves([], _, Acc) ->
     keysort(3, Acc).
 
-%% order_moves([Move], ScratchReg) -> [Move]
+%% order_moves([Move]) -> [Move]
 %%  Orders move instruction so that source registers are not
 %%  destroyed before they are used. If there are cycles
 %%  (such as {move,{x,0},{x,1}}, {move,{x,1},{x,1}}),
-%%  the scratch register is used to break up the cycle.
-%%    If possible, the first move of the input list is placed
+%%  swap instructions will be used to break up the cycle.
+%%
+%%  If possible, the first move of the input list is placed
 %%  last in the result list (to make the move to {x,0} occur
 %%  just before the call to allow the Beam loader to coalesce
 %%  the instructions).
 
-order_moves(Ms, Scr) -> order_moves(Ms, Scr, []).
+order_moves(Ms) -> order_moves(Ms, []).
 
-order_moves([{move,_,_}=M|Ms0], ScrReg, Acc0) ->
-    {Chain,Ms} = collect_chain(Ms0, [M], ScrReg),
+order_moves([{move,_,_}=M|Ms0], Acc0) ->
+    {Chain,Ms} = collect_chain(Ms0, [M]),
     Acc = reverse(Chain, Acc0),
-    order_moves(Ms, ScrReg, Acc);
-order_moves([], _, Acc) -> Acc.
+    order_moves(Ms, Acc);
+order_moves([], Acc) -> Acc.
 
-collect_chain(Ms, Path, ScrReg) ->
-    collect_chain(Ms, Path, [], ScrReg).
+collect_chain(Ms, Path) ->
+    collect_chain(Ms, Path, []).
 
-collect_chain([{move,Src,Same}=M|Ms0], [{move,Same,_}|_]=Path, Others, ScrReg) ->
+collect_chain([{move,Src,Same}=M|Ms0], [{move,Same,_}|_]=Path, Others) ->
     case keymember(Src, 3, Path) of
         false ->
-            collect_chain(reverse(Others, Ms0), [M|Path], [], ScrReg);
+            collect_chain(reverse(Others, Ms0), [M|Path], []);
         true ->
-            %% There is a cycle, which we must break up.
-            {break_up_cycle(M, Path, ScrReg),reverse(Others, Ms0)}
+            %% There is a cycle.
+            {break_up_cycle(M, Path),reverse(Others, Ms0)}
     end;
-collect_chain([M|Ms], Path, Others, ScrReg) ->
-    collect_chain(Ms, Path, [M|Others], ScrReg);
-collect_chain([], Path, Others, _) ->
+collect_chain([M|Ms], Path, Others) ->
+    collect_chain(Ms, Path, [M|Others]);
+collect_chain([], Path, Others) ->
     {Path,Others}.
 
-break_up_cycle({move,Src,_}=M, Path, ScrReg) ->
-    [{move,ScrReg,Src},M|break_up_cycle1(Src, Path, ScrReg)].
+break_up_cycle({move,Src,_Dst}=M, Path) ->
+    break_up_cycle_1(Src, [M|Path], []).
 
-break_up_cycle1(Dst, [{move,Src,Dst}|Path], ScrReg) ->
-    [{move,Src,ScrReg}|Path];
-break_up_cycle1(Dst, [M|Path], LastMove) ->
-    [M|break_up_cycle1(Dst, Path, LastMove)].
+break_up_cycle_1(Dst, [{move,_Src,Dst}|Path], Acc) ->
+    reverse(Acc, Path);
+break_up_cycle_1(Dst, [{move,S,D}|Path], Acc) ->
+    break_up_cycle_1(Dst, Path, [{swap,S,D}|Acc]).
 
 %%%
 %%% General utility functions.

@@ -1,7 +1,7 @@
 %%
 %% %CopyrightBegin%
 %%
-%% Copyright Ericsson AB 2004-2018. All Rights Reserved.
+%% Copyright Ericsson AB 2004-2019. All Rights Reserved.
 %%
 %% Licensed under the Apache License, Version 2.0 (the "License");
 %% you may not use this file except in compliance with the License.
@@ -25,7 +25,8 @@
 	 match_in_call/1,untuplify/1,shortcut_boolean/1,letify_guard/1,
 	 selectify/1,deselectify/1,underscore/1,match_map/1,map_vars_used/1,
 	 coverage/1,grab_bag/1,literal_binary/1,
-         unary_op/1,eq_types/1]).
+         unary_op/1,eq_types/1,match_after_return/1,match_right_tuple/1,
+         tuple_size_in_try/1,match_boolean_list/1]).
 	 
 -include_lib("common_test/include/ct.hrl").
 
@@ -40,7 +41,9 @@ groups() ->
        match_in_call,untuplify,
        shortcut_boolean,letify_guard,selectify,deselectify,
        underscore,match_map,map_vars_used,coverage,
-       grab_bag,literal_binary,unary_op,eq_types]}].
+       grab_bag,literal_binary,unary_op,eq_types,
+       match_after_return,match_right_tuple,
+       tuple_size_in_try,match_boolean_list]}].
 
 
 init_per_suite(Config) ->
@@ -88,6 +91,7 @@ mixed(Config) when is_list(Config) ->
     {error,blurf} = mixit(5),
     {error,87987987} = mixit(6),
     {error,{a,b,c}} = mixit(7),
+    no_match = mixed_1(),
     ok.
 
 mixit(X) ->
@@ -105,6 +109,17 @@ mixit(X) ->
 	42 -> fnurra;
 	77 -> usch;
 	Other -> {error,Other}
+    end.
+
+mixed_1() ->
+    case 0 of
+        0.0 ->
+            %% This clause must not match.
+            zero;
+        0.5 ->
+            half;
+        _ ->
+            no_match
     end.
 
 aliases(Config) when is_list(Config) ->
@@ -144,6 +159,31 @@ aliases(Config) when is_list(Config) ->
     {a,b} = list_alias1([a,b]),
     {a,b} = list_alias2([a,b]),
     {a,b} = list_alias3([a,b]),
+
+    %% Multiple matches.
+    {'EXIT',{{badmatch,home},_}} =
+        (catch fun() ->
+                       Rec = (42 = V) = home,
+                       {Rec,V}
+               end()),
+    {home,home} =
+        fun() ->
+                Rec = (home = V) = home,
+                {Rec,V}
+        end(),
+    {'EXIT',{{badmatch,16},_}} =
+        (catch fun(B) ->
+                       <<42:V>> = V = B
+               end(16)),
+    {'EXIT',{{badmatch,0},_}} =
+        (catch fun() ->
+                       <<2:V>> = V = 0
+               end()),
+    {42,42} =
+        fun(E) ->
+                Rec = (42 = V) = id(E),
+                {Rec,V}
+        end(42),
 
     ok.
 
@@ -257,6 +297,7 @@ non_matching_aliases(_Config) ->
     none = mixed_aliases(<<6789:16>>),
     none = mixed_aliases(#{key=>value}),
 
+    {'EXIT',{{badmatch,bar},_}} = (catch plus_plus_prefix()),
     {'EXIT',{{badmatch,42},_}} = (catch nomatch_alias(42)),
     {'EXIT',{{badmatch,job},_}} = (catch entirely()),
     {'EXIT',{{badmatch,associates},_}} = (catch printer()),
@@ -275,6 +316,10 @@ non_matching_aliases(_Config) ->
     1 = erase(shark),
 
     {'EXIT',{{badmatch,_},_}} = (catch radio(research)),
+
+    {'EXIT',{{case_clause,whatever},_}} = (catch pike1(whatever)),
+    {'EXIT',{{case_clause,whatever},_}} = (catch pike2(whatever)),
+
     ok.
 
 mixed_aliases(<<X:8>> = x) -> {a,X};
@@ -291,7 +336,11 @@ mixed_aliases([X] = #{key:=X}) -> {k,X};
 mixed_aliases(#{key:=X} = [X]) -> {l,X};
 mixed_aliases({a,X} = #{key:=X}) -> {m,X};
 mixed_aliases(#{key:=X} = {a,X}) -> {n,X};
+mixed_aliases([] ++ (foo = [])) -> o;
 mixed_aliases(_) -> none.
+
+plus_plus_prefix() ->
+    [] ++ (foo = []) = bar.
 
 nomatch_alias(I) ->
     {ok={A,B}} = id(I),
@@ -302,8 +351,8 @@ entirely() ->
     [receive _ -> Voice end || banking <- printer].
 
 printer() ->
-    {[Indoor] = [] = associates},
-    [ireland || Indoor <- Indoor].
+    {[_Indoor] = [] = associates},
+    [ireland || _Indoor <- _Indoor].
 
 tench() ->
     E = begin
@@ -315,7 +364,7 @@ tench() ->
 perch(X) ->
     begin
 	put(perch, get(perch)+1),
-	[A] = [] = {spine,X}
+	[_A] = [] = {spine,X}
     end.
 
 salmon() ->
@@ -332,6 +381,26 @@ radio(research) ->
     (connection = proof) =
 	(catch erlang:trace_pattern(catch mechanisms + assist,
 				    summary = mechanisms)).
+
+pike1(X) ->
+    case id([]) of
+        [] ->
+            case X of
+                [Var] = [] ->
+                    ok
+            end
+    end,
+    Var.
+
+pike2(X) ->
+    case id([]) of
+        [] ->
+            case X of
+                [_] = [] ->
+                    Var = 42
+            end
+    end,
+    Var.
 
 %% OTP-7018.
 
@@ -890,5 +959,63 @@ eq_types(A, B) ->
 
     Ref22.
 
+match_after_return(Config) when is_list(Config) ->
+    %% The return type of the following call will never match the 'wont_happen'
+    %% clauses below, and the beam_ssa_type was clever enough to see that but
+    %% didn't remove the blocks, so it crashed when trying to extract A.
+    ok = case mar_test_tuple(erlang:unique_integer()) of
+            {gurka, never_matches, A} -> {wont_happen, A};
+            _ -> ok
+         end.
+
+mar_test_tuple(I) -> {gurka, I}.
+
+match_right_tuple(Config) when is_list(Config) ->
+    %% The loader wrongly coalesced certain get_tuple_element sequences, fusing
+    %% the code below into a single i_get_tuple_element2 operating on {x,0}
+    %% even though the first one overwrites it.
+    %%
+    %%    {get_tuple_element,{x,0},0,{x,0}}.
+    %%    {get_tuple_element,{x,0},1,{x,1}}.
+
+    Inner = {id(wrong_element), id(ok)},
+    Outer = {Inner, id(wrong_tuple)},
+    ok = match_right_tuple_1(Outer).
+
+match_right_tuple_1(T) ->
+    {A, _} = T,
+    {_, B} = A,
+    %% The call ensures that A is in {x,0} and B is in {x,1}
+    id(force_succ_regs(A, B)).
+
+force_succ_regs(_A, B) -> B.
+
+tuple_size_in_try(Config) when is_list(Config) ->
+    %% The tuple_size optimization was applied outside of guards, causing
+    %% either the emulator or compiler to crash.
+    ok = tsit(gurka),
+    ok = tsit(gaffel).
+
+tsit(A) ->
+    try
+        id(ignored),
+        1 = tuple_size(A),
+        error
+    catch
+        _:_ -> ok
+    end.
+
+match_boolean_list(Config) when is_list(Config) ->
+    BoolList = [N rem 2 =:= 0 || N <- lists:seq(1, 8)],
+    %% The compiler knows that all list elements are booleans, so it translates
+    %% the expression below to a #b_br{} on the list head.
+    %%
+    %% This is fine, but since the value was only used in that branch,
+    %% reserve_zregs/3 (pre_codegen) would place the variable in a z register,
+    %% crashing the compiler in a later pass.
+    ok = case BoolList of
+             [true | _] -> error;
+             [false | _] -> ok
+         end.
 
 id(I) -> I.

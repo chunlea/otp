@@ -1,7 +1,7 @@
 %%
 %% %CopyrightBegin%
 %%
-%% Copyright Ericsson AB 2012-2018. All Rights Reserved.
+%% Copyright Ericsson AB 2012-2020. All Rights Reserved.
 %%
 %% Licensed under the Apache License, Version 2.0 (the "License");
 %% you may not use this file except in compliance with the License.
@@ -38,7 +38,7 @@ function({function,Name,Arity,CLabel,Is0}) ->
 	Is1 = rename_instrs(Is0),
 
 	%% Remove unusued labels for cleanliness and to help
-	%% optimization passes and HiPE.
+	%% optimization passes.
 	Is2 = beam_jump:remove_unused_labels(Is1),
 
         %% Some optimization passes can't handle consecutive labels.
@@ -58,9 +58,6 @@ rename_instrs([{test,is_eq_exact,_,[Dst,Src]}=Test,
     rename_instrs([Test|Is]);
 rename_instrs([{test,is_eq_exact,_,[Same,Same]}|Is]) ->
     %% Same literal or same register. Will always succeed.
-    rename_instrs(Is);
-rename_instrs([{loop_rec,{f,Fail},{x,0}},{loop_rec_end,_},{label,Fail}|Is]) ->
-    %% This instruction sequence does nothing.
     rename_instrs(Is);
 rename_instrs([{apply_last,A,N}|Is]) ->
     [{apply,A},{deallocate,N},return|rename_instrs(Is)];
@@ -122,10 +119,6 @@ rename_instr({bs_private_append=I,F,Sz,U,Src,Flags,Dst}) ->
     {bs_init,F,{I,U,Flags},none,[Sz,Src],Dst};
 rename_instr(bs_init_writable=I) ->
     {bs_init,{f,0},I,1,[{x,0}],{x,0}};
-rename_instr({test,bs_match_string=Op,F,[Ctx,Bits,{string,Str}]}) when is_list(Str) ->
-    %% When compiling from an old .S file. Starting from OTP 22, Str is a binary.
-    <<Bs:Bits/bits,_/bits>> = list_to_binary(Str),
-    {test,Op,F,[Ctx,Bs]};
 rename_instr({put_map_assoc,Fail,S,D,R,L}) ->
     {put_map,Fail,assoc,S,D,R,L};
 rename_instr({put_map_exact,Fail,S,D,R,L}) ->

@@ -1,7 +1,7 @@
 /*
  * %CopyrightBegin%
  * 
- * Copyright Ericsson AB 2002-2016. All Rights Reserved.
+ * Copyright Ericsson AB 2002-2020. All Rights Reserved.
  * 
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -153,9 +153,9 @@
 
 extern int ei_tracelevel;
 
-void ei_trace_printf(const char *name, int level, const char *format, ...);
+int ei_init_connect(void);
 
-int ei_internal_use_r9_pids_ports(void);
+void ei_trace_printf(const char *name, int level, const char *format, ...);
 
 int ei_get_cbs_ctx__(ei_socket_callbacks **cbs, void **ctx, int fd);
 

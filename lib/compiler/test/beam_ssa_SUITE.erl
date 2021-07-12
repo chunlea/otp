@@ -1,7 +1,7 @@
 %%
 %% %CopyrightBegin%
 %%
-%% Copyright Ericsson AB 2018. All Rights Reserved.
+%% Copyright Ericsson AB 2018-2020. All Rights Reserved.
 %%
 %% Licensed under the Apache License, Version 2.0 (the "License");
 %% you may not use this file except in compliance with the License.
@@ -22,12 +22,16 @@
 -export([all/0,suite/0,groups/0,init_per_suite/1,end_per_suite/1,
 	 init_per_group/2,end_per_group/2,
          calls/1,tuple_matching/1,recv/1,maps/1,
-         cover_ssa_dead/1,combine_sw/1,share_opt/1]).
+         cover_ssa_dead/1,combine_sw/1,share_opt/1,
+         beam_ssa_dead_crash/1,stack_init/1,
+         mapfoldl/0,mapfoldl/1,
+         grab_bag/1,coverage/1]).
 
 suite() -> [{ct_hooks,[ts_install_cth]}].
 
 all() ->
-    [{group,p}].
+    [mapfoldl,
+     {group,p}].
 
 groups() ->
     [{p,test_lib:parallel(),
@@ -37,7 +41,11 @@ groups() ->
        maps,
        cover_ssa_dead,
        combine_sw,
-       share_opt
+       share_opt,
+       beam_ssa_dead_crash,
+       stack_init,
+       grab_bag,
+       coverage
       ]}].
 
 init_per_suite(Config) ->
@@ -188,6 +196,25 @@ recv(_Config) ->
     self() ! {[self(),r1],{2,99,<<"data">>}},
     {Parent,r1,<<1:32,2:8,99:8,"data">>} = tricky_recv_4(),
 
+    %% Test tricky_recv_5/0.
+    self() ! 1,
+    a = tricky_recv_5(),
+    self() ! 2,
+    b = tricky_recv_5(),
+
+    %% Test tricky_recv_5a/0.
+    self() ! 1,
+    a = tricky_recv_5a(),
+    self() ! 2,
+    b = tricky_recv_5a(),
+    self() ! any,
+    b = tricky_recv_5a(),
+
+    %% tricky_recv_6/0 is a compile-time error.
+    tricky_recv_6(),
+
+    recv_coverage(),
+
     ok.
 
 sync_wait_mon({Pid, Ref}, Timeout) ->
@@ -293,14 +320,205 @@ tricky_recv_4() ->
 	end,
     id({Pid,R,Request}).
 
+%% beam_ssa_pre_codegen would accidentally create phi nodes on critical edges
+%% when fixing up receives; the call to id/2 can either succeed or land in the
+%% catch block, and we added a phi node to its immediate successor.
+tricky_recv_5() ->
+    try
+        receive
+            X=1 ->
+                id(42),
+                a;
+            X=2 ->
+                b
+        end,
+        case X of
+            1 -> a;
+            2 -> b
+        end
+    catch
+        _:_ -> c
+    end.
+
+%% beam_ssa_pre_codegen would find the wrong exit block when fixing up
+%% receives.
+tricky_recv_5a() ->
+    try
+        receive
+            X=1 ->
+                id(42),
+                a;
+            X=_ ->
+                b
+        end,
+        %% The following is the code in the common exit block.
+        if X =:= 1 -> a;
+           true -> b
+        end
+    catch
+        %% But this code with the landingpad instruction was found,
+        %% because it happened to occur before the true exit block
+        %% in the reverse post order.
+        _:_ -> c
+    end.
+
+
+%% When fixing tricky_recv_5, we introduced a compiler crash when the common
+%% exit block was ?EXCEPTION_BLOCK and floats were in the picture.
+tricky_recv_6() ->
+    RefA = make_ref(),
+    RefB = make_ref(),
+    receive
+        {RefA, Number} -> Number + 1.0;
+        {RefB, Number} -> Number + 2.0
+    after 0 ->
+        ok
+    end.
+
+recv_coverage() ->
+    self() ! 1,
+    a = recv_coverage_1(),
+    self() ! 2,
+    b = recv_coverage_1(),
+
+    self() ! 1,
+    a = recv_coverage_2(),
+    self() ! 2,
+    b = recv_coverage_2(),
+
+    ok.
+
+%% Similar to tricky_recv_5/0, but provides test coverage for the #b_switch{}
+%% terminator.
+recv_coverage_1() ->
+    receive
+        X=1 ->
+            %% Jump to common exit block through #b_switch{list=L}
+            case id(0) of
+                0 -> a;
+                1 -> b;
+                2 -> c;
+                3 -> d
+            end;
+        X=2 ->
+            %% Jump to common exit block through #b_switch{fail=F}
+            case id(42) of
+                0 -> exit(quit);
+                1 -> exit(quit);
+                2 -> exit(quit);
+                3 -> exit(quit);
+                _ -> b
+            end
+    end,
+    case X of
+        1 -> a;
+        2 -> b
+    end.
+
+%% Similar to recv_coverage_1/0, providing test coverage for #b_br{}.
+recv_coverage_2() ->
+    receive
+        X=1 ->
+            A = id(1),
+            %% Jump to common exit block through #b_br{succ=S}.
+            if
+                A =:= 1 -> a;
+                true -> exit(quit)
+            end;
+        X=2 ->
+            A = id(2),
+            %% Jump to common exit block through #b_br{fail=F}.
+            if
+                A =:= 1 -> exit(quit);
+                true -> a
+            end
+    end,
+    case X of
+        1 -> a;
+        2 -> b
+    end.
+
 maps(_Config) ->
     {'EXIT',{{badmatch,#{}},_}} = (catch maps_1(any)),
+
+    {jkl,nil,nil} = maps_2(#{abc => 0, jkl => 0}),
+    {def,ghi,abc} = maps_2(#{abc => 0, def => 0}),
+    {def,ghi,jkl} = maps_2(#{def => 0, jkl => 0}),
+    {mno,nil,abc} = maps_2(#{abc => 0, mno => 0, jkl => 0}),
+    {jkl,nil,nil} = maps_2(#{jkl => 0}),
+    error = maps_2(#{}),
+
     ok.
 
 maps_1(K) ->
     _ = id(42),
     #{K:=V} = #{},
     V.
+
+maps_2(Map) ->
+    Res = maps_2a(Map),
+    Res = maps_2b(Map),
+    Res.
+
+maps_2a(#{} = Map) ->
+    case case Abc = is_map_key(abc, Map) of
+             false -> false;
+             _ -> is_map_key(def, Map)
+         end of
+        true ->
+            {def, ghi, abc};
+        false ->
+            case case Jkl = is_map_key(jkl, Map) of
+                     false -> false;
+                     _ -> is_map_key(def, Map)
+                 end of
+                true ->
+                    {def, ghi, jkl};
+                false ->
+                    case case Abc of
+                             false -> false;
+                             _ -> is_map_key(mno, Map)
+                         end of
+                        true ->
+                            {mno, nil, abc};
+                        false ->
+                            case Jkl of
+                                true -> {jkl, nil, nil};
+                                false -> error
+                            end
+                    end
+            end
+    end.
+
+maps_2b(#{}=Map) ->
+    case case is_map_key(abc, Map) of
+             false -> false;
+             _ -> is_map_key(def, Map)
+         end of
+        true ->
+            {def, ghi, abc};
+        false ->
+            case case is_map_key(jkl, Map) of
+                     false -> false;
+                     _ -> is_map_key(def, Map)
+                 end of
+                true ->
+                    {def, ghi, jkl};
+                false ->
+                    case case is_map_key(abc, Map) of
+                             false -> false;
+                             _ -> is_map_key(mno, Map)
+                         end of
+                        true ->
+                            {mno, nil, abc};
+                        false ->
+                            case is_map_key(jkl, Map) of
+                                true -> {jkl, nil, nil};
+                                false -> error
+                            end
+                    end
+            end
+    end.
 
 -record(wx_ref, {type=any_type,ref=any_ref}).
 
@@ -344,47 +562,13 @@ cover_ssa_dead(_Config) ->
     40.0 = percentage(4.0, 10.0),
     60.0 = percentage(6, 10),
 
-    %% Cover '=:=', followed by '=/='.
-    false = 'cover__=:=__=/='(41),
-    true = 'cover__=:=__=/='(42),
-    false = 'cover__=:=__=/='(43),
+    {'EXIT',{{badmatch,42},_}} = (catch #{key => abs(("a" = id(42)) /= teacher)}),
 
-    %% Cover '<', followed by '=/='.
-    true = 'cover__<__=/='(41),
-    false = 'cover__<__=/='(42),
-    false = 'cover__<__=/='(43),
+    <<>> = id(<< V || V <- [], V andalso false >>),
 
-    %% Cover '=<', followed by '=/='.
-    true = 'cover__=<__=/='(41),
-    true = 'cover__=<__=/='(42),
-    false = 'cover__=<__=/='(43),
-
-    %% Cover '>=', followed by '=/='.
-    false = 'cover__>=__=/='(41),
-    true = 'cover__>=__=/='(42),
-    true = 'cover__>=__=/='(43),
-
-    %% Cover '>', followed by '=/='.
-    false = 'cover__>__=/='(41),
-    false = 'cover__>__=/='(42),
-    true = 'cover__>__=/='(43),
+    false = id(([] = id([])) =/= []),
 
     ok.
-
-'cover__=:=__=/='(X) when X =:= 42 -> X =/= 43;
-'cover__=:=__=/='(_) -> false.
-
-'cover__<__=/='(X) when X < 42 -> X =/= 42;
-'cover__<__=/='(_) -> false.
-
-'cover__=<__=/='(X) when X =< 42 -> X =/= 43;
-'cover__=<__=/='(_) -> false.
-
-'cover__>=__=/='(X) when X >= 42 -> X =/= 41;
-'cover__>=__=/='(_) -> false.
-
-'cover__>__=/='(X) when X > 42 -> X =/= 42;
-'cover__>__=/='(_) -> false.
 
 format_str(Str, FormatData, IoList, EscChars) ->
     Escapable = FormatData =:= escapable,
@@ -481,9 +665,11 @@ do_comb_sw_2(X) ->
     erase(?MODULE).
 
 share_opt(_Config) ->
-    ok = do_share_opt(0).
+    ok = do_share_opt_1(0),
+    ok = do_share_opt_2(),
+    ok.
 
-do_share_opt(A) ->
+do_share_opt_1(A) ->
     %% The compiler would be stuck in an infinite loop in beam_ssa_share.
     case A of
         0 -> a;
@@ -492,6 +678,442 @@ do_share_opt(A) ->
     end,
     receive after 1 -> ok end.
 
+do_share_opt_2() ->
+    ok = sopt_2({[pointtopoint], [{dstaddr,any}]}, ok),
+    ok = sopt_2({[broadcast], [{broadaddr,any}]}, ok),
+    ok = sopt_2({[], []}, ok),
+    ok.
+
+sopt_2({Flags, Opts}, ok) ->
+    Broadcast = lists:member(broadcast, Flags),
+    P2P = lists:member(pointtopoint, Flags),
+    case Opts of
+        %% The following two clauses would be combined to one, silently
+        %% discarding the guard test of the P2P variable.
+        [{broadaddr,_}|Os] when Broadcast ->
+            sopt_2({Flags, Os}, ok);
+        [{dstaddr,_}|Os] when P2P ->
+            sopt_2({Flags, Os}, ok);
+        [] ->
+            ok
+    end.
+    
+beam_ssa_dead_crash(_Config) ->
+    not_A_B = do_beam_ssa_dead_crash(id(false), id(true)),
+    not_A_not_B = do_beam_ssa_dead_crash(false, false),
+    neither = do_beam_ssa_dead_crash(true, false),
+    neither = do_beam_ssa_dead_crash(true, true),
+    ok.
+
+do_beam_ssa_dead_crash(A, B) ->
+    %% beam_ssa_dead attempts to shortcut branches that branch other
+    %% branches. When a two-way branch is encountered, beam_ssa_dead
+    %% will simulate execution along both paths, in the hope that both
+    %% paths happens to end up in the same place.
+    %%
+    %% During the simulated execution of this function, the boolean
+    %% varible for a `br` instruction would be replaced with the
+    %% literal atom `nil`, which is not allowed, and would crash the
+    %% compiler. In practice, during the actual execution, control
+    %% would never be transferred to that `br` instruction when the
+    %% variable in question had the value `nil`.
+    %%
+    %% beam_ssa_dead has been updated to immediately abort the search
+    %% along the current path if there is an attempt to substitute a
+    %% non-boolean value into a `br` instruction.
+
+    case
+        case not A of
+            false ->
+                false;
+            true ->
+                B
+        end
+    of
+        V
+            when
+                V /= nil
+                andalso
+                V /= false ->
+            not_A_B;
+        _ ->
+            case
+                case not A of
+                    false ->
+                        false;
+                    true ->
+                        not B
+                end
+            of
+                true ->
+                    not_A_not_B;
+                false ->
+                    neither
+            end
+    end.
+
+stack_init(_Config) ->
+    6 = stack_init(a, #{a => [1,2,3]}),
+    0 = stack_init(missing, #{}),
+    ok.
+
+stack_init(Key, Map) ->
+    %% beam_ssa_codegen would wrongly assume that y(0) would always be
+    %% initialized by the `get_map_elements` instruction that follows, and
+    %% would set up the stack frame using an `allocate` instruction and
+    %% would not generate an `init` instruction to initialize y(0).
+    Res = case Map of
+              #{Key := Elements} ->
+                  %% Elements will be assigned to y(0) if the key Key exists.
+                  lists:foldl(fun(El, Acc) ->
+                                      Acc + El
+                              end, 0, Elements);
+              #{} ->
+                  %% y(0) will be left uninitialized when the key is not
+                  %% present in the map.
+                  0
+          end,
+    %% y(0) would be uninitialized here if the key was not present in the map
+    %% (if the second clause was executed).
+    id(Res).
+
+%% Test that compiler "optimizations" don't rewrite mapfold/3 to the
+%% equivalent of slow_mapfoldl/3.
+mapfoldl() ->
+    {N,Size} = mapfoldl_limits(),
+    {Time,_} = timer:tc(fun() ->
+                                mapfoldl(fun(Sz, _) ->
+                                                 erlang:garbage_collect(),
+                                                 {Sz,erlang:make_tuple(Sz, a)}
+                                         end, [], [Size])
+                        end),
+    Seconds = 15 + ceil(10 * Time * N / 1_000_000),
+    io:format("~p seconds timetrap\n", [Seconds]),
+    [{timetrap,{seconds,Seconds}}].
+
+mapfoldl(_Config) ->
+    test_mapfoldl_implementations(),
+    F = fun(Sz, _) ->
+                erlang:garbage_collect(),
+                {Sz,erlang:make_tuple(Sz, a)}
+        end,
+    {N,Size} = mapfoldl_limits(),
+    List = lists:duplicate(N, Size),
+    {List,Tuple} = mapfoldl(F, [], List),
+    {List,Tuple} = fast_mapfoldl(F, [], List),
+    Size = tuple_size(Tuple),
+    ok.
+
+mapfoldl_limits() ->
+    {1_000,100_000}.
+
+test_mapfoldl_implementations() ->
+    Seq = lists:seq(1, 10),
+    F = fun(N, Sum) -> {N,Sum+N} end,
+    {Seq,55} = mapfoldl(F, 0, Seq),
+    {Seq,55} = fast_mapfoldl(F, 0, Seq),
+    {Seq,55} = slow_mapfoldl(F, 0, Seq),
+    ok.
+
+mapfoldl(F, Acc0, [Hd|Tail]) ->
+    {R,Acc1} = F(Hd, Acc0),
+    {Rs,Acc2} = mapfoldl(F, Acc1, Tail),
+    {[R|Rs],Acc2};
+mapfoldl(F, Acc, []) when is_function(F, 2) -> {[],Acc}.
+
+%% Here is an illustration of how the compiler used to sink
+%% get_tuple_element instructions in a way that would cause all
+%% versions of the accumulator to be kept until the end. The compiler
+%% now uses a heuristic to only sink get_tuple_element instructions if
+%% that would cause fewer values to be saved in the stack frame.
+slow_mapfoldl(F, Acc0, [Hd|Tail]) ->
+    Res1 = F(Hd, Acc0),
+    %% By saving the Res1 tuple, all intermediate accumulators will be
+    %% kept to the end.
+    Res2 = slow_mapfoldl(F, element(2, Res1), Tail),
+    {[element(1, Res1)|element(1, Res2)],element(2, Res2)};
+slow_mapfoldl(F, Acc, []) when is_function(F, 2) -> {[],Acc}.
+
+%% Here is an illustration how the compiler should compile mapfoldl/3
+%% to avoid keeping all intermediate accumulators. Note that
+%% slow_mapfoldl/3 and fast_mapfoldl/3 use the same amount of stack
+%% space.
+fast_mapfoldl(F, Acc0, [Hd|Tail]) ->
+    Res1 = F(Hd, Acc0),
+    R = element(1, Res1),
+    Res2 = fast_mapfoldl(F, element(2, Res1), Tail),
+    {[R|element(1, Res2)],element(2, Res2)};
+fast_mapfoldl(F, Acc, []) when is_function(F, 2) -> {[],Acc}.
+
+grab_bag(_Config) ->
+    {'EXIT',_} = (catch grab_bag_1()),
+    {'EXIT',_} = (catch grab_bag_2()),
+    {'EXIT',_} = (catch grab_bag_3()),
+    {'EXIT',_} = (catch grab_bag_4()),
+    {'EXIT',{function_clause,[{?MODULE,grab_bag_5,[a,17],_}|_]}} =
+        (catch grab_bag_5(a, 17)),
+    way = grab_bag_6(face),
+    no_match = grab_bag_6("ABC"),
+    no_match = grab_bag_6(any),
+    ok = grab_bag_7(),
+    [] = grab_bag_8(),
+    ok = grab_bag_9(),
+    whatever = grab_bag_10(ignore, whatever),
+    other = grab_bag_11(),
+    {'EXIT',_} = (catch grab_bag_12()),
+    {'EXIT',{{badmatch,[]},_}} = (catch grab_bag_13()),
+    timeout = grab_bag_14(),
+    ?MODULE = grab_bag_15(?MODULE),
+
+    error = grab_bag_16a(timeout_value),
+    {'EXIT',{timeout_value,_}} = (catch grab_bag_16a(whatever)),
+    {'EXIT',{timeout_value,_}} = (catch grab_bag_16b(whatever)),
+    timeout_value = grab_bag_16b(error),
+
+    fact = grab_bag_17(),
+
+    ok.
+
+grab_bag_1() ->
+    %% beam_kernel_to_ssa would crash when attempting to translate a make_fun
+    %% instruction without a destination variable.
+    (catch fun () -> 15 end)(true#{}).
+
+grab_bag_2() ->
+    %% is_guard_cg_safe/1 will be called with #cg_unreachable{}, which was
+    %% not handled.
+    27
+        or
+    try
+        try
+            x#{}
+        catch
+            _:_ ->
+                []
+        end
+    after
+        false
+    end.
+
+grab_bag_3() ->
+    case
+        fun (V0)
+              when
+                  %% The only thing left after optimizations would be
+                  %% a bs_add instruction not followed by succeeded,
+                  %% which would crash beam_ssa_codegen because there
+                  %% was no failure label available.
+                  binary_part(<<>>,
+                              <<V0:V0/unit:196>>) ->
+                []
+        end
+    of
+        <<>> ->
+            []
+    end.
+
+grab_bag_4() ->
+    %% beam_kernel_to_ssa would crash because there was a #cg_phi{}
+    %% instruction that was not referenced from any #cg_break{}.
+    case $f of
+        V0 ->
+            try
+                try fy of
+                    V0 ->
+                        fu
+                catch
+                    throw:$s ->
+                        fy
+                end
+            catch
+                error:#{#{[] + [] => []} := false} when [] ->
+                    fy
+            after
+                ok
+            end
+    end.
+
+grab_bag_5(_A, _B) when <<business:(node(power))>> ->
+    true.
+
+grab_bag_6(face) ->
+    way;
+grab_bag_6("ABC") when (node([]))#{size(door) => $k} ->
+    false;
+grab_bag_6(_) ->
+    no_match.
+
+grab_bag_7() ->
+    catch
+        case
+            case 1.6 of
+                %% The hd([] call will be translated to erlang:error(badarg).
+                %% This case exports two variables in Core Erlang (the
+                %% return value of the case and V). beam_kernel_to_ssa was not
+                %% prepared to handle a call to error/1 which is supposed to
+                %% export two variables.
+                <<0.5:(hd([])),V:false>> ->
+                    ok
+            end
+        of
+            _ ->
+                V
+        end,
+        ok.
+
+%% ssa_opt_sink would crash if sys_core_fold had not been run.
+grab_bag_8() ->
+    try
+        []
+    catch
+        _:_ ->
+            try
+                []
+            catch
+                _:any:_ ->
+                    a
+            end;
+        _:right ->
+            b
+    end.
+
+%% The ssa_opt_try optimization would leave a succeeded:body
+%% instruction followed by a #b_ret{} terminator, which would crash
+%% beam_ssa_pre_codegen.
+grab_bag_9() ->
+    catch
+        <<1 || 99, [] <- hour>> bsr false,
+        ok.
+
+grab_bag_10(_, V) ->
+    %% This function needs a stack frame in order to preserve V.
+    fun() -> ok end,
+    V.
+
+grab_bag_11() ->
+    try 0 of
+        false -> error;
+        true -> ok;
+        _ -> other
+    catch
+        _:_ ->
+            catched
+    end.
+
+grab_bag_12() ->
+    %% beam_ssa_pre_codegen would try to place the created map in x1.
+    %% That would not be safe because x0 is not initialized.
+    check_process_code(1, (#{})#{key := teacher}),
+    ok.
+
+grab_bag_13() ->
+    %% If sys_core_fold was skipped, beam_ssa_beam would leave
+    %% unreachable code with invalid phi nodes.
+    case <<810:true>> = [] of
+        <<709:false>> ->
+            ok;
+        whatever ->
+            case 42 of
+                175 ->
+                    {ok,case "b" of
+                            $X -> time
+                        end}
+            end
+    end.
+
+grab_bag_14() ->
+    %% If optimizations were turned off, beam_ssa_pre_codegen would
+    %% sanitize the binary construction instruction, replacing it with
+    %% a call to erlang:error/1, which is not allowed in a receive.
+    receive
+        #{<<42:(-1)>> := _} ->
+            ok
+    after 0 ->
+            timeout
+    end.
+
+grab_bag_15(V) ->
+    %% Instead of:
+    %%
+    %%    move x0, y0
+    %%    move y0, x0
+    %%
+    %% a swap instruction would be emitted by beam_ssa_codegen:
+    %%
+    %%    swap x0, y0
+    %%
+    case [] of
+        [] -> V
+    end:all(),
+    V.
+
+grab_bag_16a(V) ->
+    try
+        catch 22,
+    receive
+    after bad ->
+            not_reached
+    end
+    catch
+        _:V ->
+            error
+    end.
+
+grab_bag_16b(V) ->
+    try
+        receive
+        after get() ->
+                ok
+        end
+    catch
+        V:Reason ->
+            Reason
+    end.
+
+grab_bag_17() ->
+    try "xwCl" of
+        V when V ->
+            <<[] || V>>;
+        [_|_] ->
+            %% Constant propagation in beam_ssa_codegen:prefer_xregs/2
+            %% would produce get_hd and get_tl instructions with literal
+            %% operands.
+            fact
+    catch
+        _:_ ->
+            []
+    end.
+
+
+coverage(_Config) ->
+
+    %% Cover beam_ssa_codegen:force_reg/2
+    no_match = case true of
+                   <<_:42>> -> true;
+                   _ -> no_match
+              end,
+
+    no_match = case [] of
+                   <<$f:1.7>> -> ok;
+                   _ -> no_match
+               end,
+    {'EXIT',{{badmatch,$T},_}} = (catch coverage_1()),
+
+    error = coverage_2(),
+    ok = coverage_3(),
+
+    ok.
+
+coverage_1() ->
+    <<area/signed-bitstring>> = $T.
+
+coverage_2() when << []:<<0/native>> >> -> ok;
+coverage_2() -> error.
+
+coverage_3() ->
+    %% Cover a line in beam_ssa_pre_codegen:need_frame_1/2.
+    get(),
+    ok.
 
 %% The identity function.
 id(I) -> I.

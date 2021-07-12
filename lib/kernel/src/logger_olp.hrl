@@ -1,7 +1,7 @@
 %%
 %% %CopyrightBegin%
 %%
-%% Copyright Ericsson AB 1997-2015. All Rights Reserved.
+%% Copyright Ericsson AB 1997-2020. All Rights Reserved.
 %%
 %% Licensed under the Apache License, Version 2.0 (the "License");
 %% you may not use this file except in compliance with the License.
@@ -72,25 +72,8 @@
 
 -define(timestamp(), erlang:monotonic_time(microsecond)).
 
--define(get_mode(Tid),
-        case ets:lookup(Tid, mode) of
-            [{mode,M}] -> M;
-            _          -> async
-        end).
-
--define(set_mode(Tid, M),
-        begin ets:insert(Tid, {mode,M}), M end).
-
--define(change_mode(Tid, M0, M1),
-        if M0 == M1 ->
-                M0;
-           true ->
-                ets:insert(Tid, {mode,M1}),
-                M1
-        end).
-
 -define(max(X1, X2),
-        if 
+        if
             X2 == undefined -> X1;
             X2 > X1 -> X2;
             true -> X1
@@ -114,11 +97,15 @@
                      flushes => 0, flushed => 0, drops => 0,
                      burst_drops => 0, casts => 0, calls => 0,
                      writes => 0, max_qlen => 0, max_time => 0,
-                     freq => {TIME,0,0}} end).
+                     max_mem => 0, freq => {TIME,0,0}} end).
 
   -define(update_max_qlen(QLEN, STATE),
           begin #{max_qlen := QLEN0} = STATE,
                 STATE#{max_qlen => ?max(QLEN0,QLEN)} end).
+
+  -define(update_max_mem(MEM, STATE),
+          begin #{max_mem := MEM0} = STATE,
+                STATE#{max_mem => ?max(MEM0,MEM)} end).
 
   -define(update_calls_or_casts(CALL_OR_CAST, INC, STATE),
           case CALL_OR_CAST of
@@ -154,6 +141,7 @@
 -else.                                          % DEFAULT!
   -define(merge_with_stats(STATE), STATE).
   -define(update_max_qlen(_QLEN, STATE), STATE).
+  -define(update_max_mem(_MEM, STATE), STATE).
   -define(update_calls_or_casts(_CALL_OR_CAST, _INC, STATE), STATE).
   -define(update_max_time(_TIME, STATE), STATE).
   -define(update_other(_OTHER, _VAR, _INCVAL, STATE), STATE).

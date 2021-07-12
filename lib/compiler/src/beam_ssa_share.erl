@@ -1,7 +1,7 @@
 %%
 %% %CopyrightBegin%
 %%
-%% Copyright Ericsson AB 2018. All Rights Reserved.
+%% Copyright Ericsson AB 2018-2020. All Rights Reserved.
 %%
 %% Licensed under the Apache License, Version 2.0 (the "License");
 %% you may not use this file except in compliance with the License.
@@ -51,10 +51,25 @@ module(#b_module{body=Fs0}=Module, _Opts) ->
       Blocks0 :: beam_ssa:block_map(),
       Blk :: beam_ssa:b_blk().
 
-block(#b_blk{last=Last0}=Blk, Blocks) ->
+block(#b_blk{is=Is0,last=Last0}=Blk, Blocks) ->
     case share_terminator(Last0, Blocks) of
-        none -> Blk;
-        Last -> Blk#b_blk{last=beam_ssa:normalize(Last)}
+        none ->
+            Blk;
+        #b_br{succ=Same,fail=Same}=Last ->
+            %% The terminator was reduced from a two-way branch to a
+            %% one-way branch.
+            case reverse(Is0) of
+                [#b_set{op={succeeded,Kind},args=[Dst]},#b_set{dst=Dst}|Is] ->
+                    %% A succeeded instruction must not be followed by a
+                    %% one-way branch. We must remove both the succeeded
+                    %% instruction and the instruction preceding it.
+                    guard = Kind,               %Assertion.
+                    Blk#b_blk{is=reverse(Is),last=beam_ssa:normalize(Last)};
+                _ ->
+                    Blk#b_blk{last=beam_ssa:normalize(Last)}
+            end;
+        Last ->
+            Blk#b_blk{last=beam_ssa:normalize(Last)}
     end.
 
 %%%
@@ -117,8 +132,8 @@ share_terminator(_Last, _Blocks) -> none.
 %% possible if the blocks are not equivalent, as that is the common
 %% case.
 
-are_equivalent(_Succ, _, ?BADARG_BLOCK, _, _Blocks) ->
-    %% ?BADARG_BLOCK is special. Sharing could be incorrect.
+are_equivalent(_Succ, _, ?EXCEPTION_BLOCK, _, _Blocks) ->
+    %% ?EXCEPTION_BLOCK is special. Sharing could be incorrect.
     false;
 are_equivalent(_Succ, #b_blk{is=Is1,last=#b_ret{arg=RetVal1}=Ret1},
          _Fail, #b_blk{is=Is2,last=#b_ret{arg=RetVal2}=Ret2}, _Blocks) ->
@@ -240,6 +255,12 @@ share_switch_2([[{_,_}|_]=Prep|T], Blocks, Acc0) ->
     share_switch_2(T, Blocks, Acc);
 share_switch_2([], _, Acc) -> Acc.
 
+canonical_block({?EXCEPTION_BLOCK,_VarMap}, _Blocks) ->
+    %% Never ever share the ?EXCEPTION_BLOCK with another block.
+    %% Unless the entire switch or br is optimized away, a
+    %% {f,0} can be emitted where it is not allowed and a later
+    %% pass will crash.
+    {{none,?EXCEPTION_BLOCK},done};
 canonical_block({L,VarMap0}, Blocks) ->
     #b_blk{is=Is,last=Last0} = map_get(L, Blocks),
     case canonical_terminator(L, Last0, Blocks) of
@@ -303,8 +324,12 @@ canonical_is([#b_ret{arg=Arg}], VarMap, Acc0) ->
                    Acc0
            end,
     {{ret,canonical_arg(Arg, VarMap),Acc1},VarMap};
-canonical_is([#b_br{bool=#b_var{},fail=Fail}], VarMap, Acc) ->
-    {{br,succ,Fail,Acc},VarMap};
+canonical_is([#b_br{bool=#b_var{}=Arg,fail=Fail}], VarMap, Acc) ->
+    %% A previous buggy version of this code omitted the canonicalized
+    %% argument in the return value. Unfortunately, that worked most
+    %% of the time, except when `br` terminator referenced a variable
+    %% defined in a previous block instead of in the same block.
+    {{br,canonical_arg(Arg, VarMap),succ,Fail,Acc},VarMap};
 canonical_is([#b_br{succ=Succ}], VarMap, Acc) ->
     {{br,Succ,Acc},VarMap};
 canonical_is([], VarMap, Acc) ->
@@ -327,11 +352,16 @@ canonical_terminator(_, _, _) -> none.
 canonical_terminator_phis([#b_set{op=phi,args=PhiArgs}=Phi|Is], L) ->
     {Value,L} = keyfind(L, 2, PhiArgs),
     [Phi#b_set{op=copy,args=[Value]}|canonical_terminator_phis(Is, L)];
-canonical_terminator_phis([#b_set{op=peek_message}=I|_], L) ->
-    %% We could get stuck into an infinite loop if we allowed the
-    %% comparisons to continue into this block. Force an unequal
-    %% compare with all other predecessors of this block.
-    [I#b_set{op=copy,args=[#b_literal{val=L}]}];
+canonical_terminator_phis([#b_set{}=I|_], L) ->
+    case beam_ssa:is_loop_header(I) of
+        true ->
+            %% We could get stuck into an infinite loop if we allowed the
+            %% comparisons to continue into this loop. Force an unequal
+            %% compare with all other predecessors of this block.
+            [I#b_set{op=copy,args=[#b_literal{val=L}]}];
+        false ->
+            []
+    end;
 canonical_terminator_phis(_, _) -> [].
 
 canonical_arg(#b_var{}=Var, VarMap) ->
@@ -364,7 +394,9 @@ shortcut_nonempty_block(L, Blocks) ->
 
 is_forbidden(L, Blocks) ->
     case map_get(L, Blocks) of
-        #b_blk{is=[#b_set{op=phi}|_]} -> true;
-        #b_blk{is=[#b_set{op=peek_message}|_]} -> true;
+        #b_blk{is=[#b_set{op=phi}|_]} ->
+            true;
+        #b_blk{is=[#b_set{}=I|_]} ->
+            beam_ssa:is_loop_header(I);
         #b_blk{} -> false
     end.

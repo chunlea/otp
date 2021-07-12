@@ -1,7 +1,7 @@
 %%
 %% %CopyrightBegin%
 %%
-%% Copyright Ericsson AB 2011-2017. All Rights Reserved.
+%% Copyright Ericsson AB 2011-2021. All Rights Reserved.
 %%
 %% Licensed under the Apache License, Version 2.0 (the "License");
 %% you may not use this file except in compliance with the License.
@@ -22,7 +22,7 @@
 
 -export([start/0, stop/0]).
 -export([create_menus/2, get_attrib/1, get_tracer/0, get_active_node/0, get_menubar/0,
-	 set_status/1, create_txt_dialog/4, try_rpc/4, return_to_localnode/2]).
+     get_scale/0, set_status/1, create_txt_dialog/4, try_rpc/4, return_to_localnode/2]).
 
 -export([init/1, handle_event/2, handle_cast/2, terminate/2, code_change/3,
 	 handle_call/3, handle_info/2, check_page_title/1]).
@@ -91,14 +91,25 @@ get_active_node() ->
 get_menubar() ->
     wx_object:call(observer, get_menubar).
 
+get_scale() ->
+    ScaleStr = os:getenv("OBSERVER_SCALE", "1"),
+    try list_to_integer(ScaleStr) of
+        Scale when Scale < 1 -> 1;
+        Scale -> Scale
+    catch _:_ ->
+        1
+    end.
+
 %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
 
 init(_Args) ->
+    %% put(debug, true),
     register(observer, self()),
     wx:new(),
     catch wxSystemOptions:setOption("mac.listctrl.always_use_generic", 1),
+    Scale = get_scale(),
     Frame = wxFrame:new(wx:null(), ?wxID_ANY, "Observer",
-			[{size, {850, 600}}, {style, ?wxDEFAULT_FRAME_STYLE}]),
+			[{size, {Scale * 850, Scale * 600}}, {style, ?wxDEFAULT_FRAME_STYLE}]),
     IconFile = filename:join(code:priv_dir(observer), "erlang_observer.png"),
     Icon = wxIcon:new(IconFile, [{type,?wxBITMAP_TYPE_PNG}]),
     wxFrame:setIcon(Frame, Icon),
@@ -176,6 +187,12 @@ setup(#state{frame = Frame} = State) ->
     PortPanel = observer_port_wx:start_link(Notebook, self(), Cnf(port_panel)),
     wxNotebook:addPage(Notebook, PortPanel, "Ports", []),
 
+    %% Socket Panel
+    SockPanel = observer_sock_wx:start_link(Notebook,
+					    self(),
+					    Cnf(sock_panel)),
+    wxNotebook:addPage(Notebook, SockPanel, "Sockets", []),
+
     %% Table Viewer Panel
     TVPanel = observer_tv_wx:start_link(Notebook, self(), Cnf(tv_panel)),
     wxNotebook:addPage(Notebook, TVPanel, "Table Viewer", []),
@@ -193,26 +210,32 @@ setup(#state{frame = Frame} = State) ->
 
     SysPid = wx_object:get_pid(SysPanel),
     SysPid ! {active, node()},
-    Panels = [{sys_panel, SysPanel, "System"},   %% In order
-              {perf_panel, PerfPanel, "Load Charts"},
-              {allc_panel, AllcPanel, ?ALLOC_STR},
-              {app_panel,  AppPanel, "Applications"},
-              {pro_panel, ProPanel, "Processes"},
-              {port_panel, PortPanel, "Ports"},
-              {tv_panel, TVPanel, "Table Viewer"},
-              {trace_panel, TracePanel, ?TRACE_STR}],
+    Panels =
+	[{sys_panel,   SysPanel,   "System"},   %% In order
+	 {perf_panel,  PerfPanel,  "Load Charts"},
+	 {allc_panel,  AllcPanel,  ?ALLOC_STR},
+	 {app_panel,   AppPanel,   "Applications"},
+	 {pro_panel,   ProPanel,   "Processes"},
+	 {port_panel,  PortPanel,  "Ports"},
+	%% if (SockPanel =:= undefined) -> [];
+	%%    true -> 
+	%% 	[{sock_panel,  SockPanel,  "Sockets"}]
+	%% end ++ 
+	 {sock_panel,  SockPanel,  "Sockets"},
+	 {tv_panel,    TVPanel,    "Table Viewer"},
+	 {trace_panel, TracePanel, ?TRACE_STR}],
 
     UpdState = State#state{main_panel = Panel,
-			   notebook = Notebook,
-			   menubar = MenuBar,
+			   notebook   = Notebook,
+			   menubar    = MenuBar,
 			   status_bar = StatusBar,
 			   active_tab = SysPid,
-                           panels = Panels,
-			   node  = node(),
-			   nodes = Nodes
+                           panels     = Panels,
+			   node       = node(),
+			   nodes      = Nodes
 			  },
     %% Create resources which we don't want to duplicate
-    SysFont = wxSystemSettings:getFont(?wxSYS_SYSTEM_FIXED_FONT),
+    SysFont = wxSystemSettings:getFont(?wxSYS_OEM_FIXED_FONT),
     %% OemFont = wxSystemSettings:getFont(?wxSYS_OEM_FIXED_FONT),
     %% io:format("Sz sys ~p(~p) oem ~p(~p)~n",
     %% 	      [wxFont:getPointSize(SysFont), wxFont:isFixedWidth(SysFont),
@@ -230,7 +253,7 @@ setup(#state{frame = Frame} = State) ->
 %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
 
 %%Callbacks
-handle_event(#wx{event=#wxNotebook{type=command_notebook_page_changed, nSel=Next}},
+handle_event(#wx{event=#wxBookCtrl{type=command_notebook_page_changed, nSel=Next}},
 	     #state{active_tab=Previous, node=Node, panels=Panels, status_bar=SB} = State) ->
     {_, Obj, _} = lists:nth(Next+1, Panels),
     case wx_object:get_pid(Obj) of
@@ -771,7 +794,11 @@ ensure_sasl_started(Node) ->
 
 ensure_mf_h_handler_used(Node) ->
    %% is log_mf_h used ?
-   Handlers = rpc:block_call(Node, gen_event, which_handlers, [error_logger]),
+   Handlers =
+        case rpc:block_call(Node, gen_event, which_handlers, [error_logger]) of
+            {badrpc,{'EXIT',noproc}} -> []; % OTP-21+ and no event handler exists
+            Hs -> Hs
+        end,
    case lists:any(fun(L)-> L == log_mf_h end, Handlers) of
        false -> throw("Error: log_mf_h handler not used in sasl."),
                 error;
@@ -815,3 +842,17 @@ is_rb_server_running(Node, LogState) ->
        undefined ->
 	   ok
    end.
+
+
+%% d(F) ->
+%%     d(F, []).
+
+%% d(F, A) ->
+%%     d(get(debug), F, A).
+
+%% d(true, F, A) ->
+%%     io:format("[owx] " ++ F ++ "~n", A);
+%% d(_, _, _) ->
+%%     ok.
+
+

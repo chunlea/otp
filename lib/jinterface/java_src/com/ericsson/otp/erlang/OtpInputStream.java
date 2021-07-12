@@ -239,6 +239,20 @@ public class OtpInputStream extends ByteArrayInputStream {
     }
 
     /**
+     * Read a eight byte big endian integer from the stream.
+     *
+     * @return the bytes read, converted from big endian to a long integer.
+     *
+     * @exception OtpErlangDecodeException
+     *                if the next byte cannot be read.
+     */
+    public long read8BE() throws OtpErlangDecodeException {
+        long high = read4BE();
+        long low = read4BE();
+        return (high << 32) | (low & 0xffffffff);
+    }
+
+    /**
      * Read a two byte little endian integer from the stream.
      *
      * @return the bytes read, converted from little endian to an integer.
@@ -983,26 +997,34 @@ public class OtpInputStream extends ByteArrayInputStream {
      */
     public OtpErlangPort read_port() throws OtpErlangDecodeException {
         String node;
-        int id;
+        long id;
         int creation;
         int tag;
 
         tag = read1skip_version();
 
         if (tag != OtpExternal.portTag &&
-	    tag != OtpExternal.newPortTag) {
+	    tag != OtpExternal.newPortTag &&
+	    tag != OtpExternal.v4PortTag) {
             throw new OtpErlangDecodeException(
                     "Wrong tag encountered, expected " + OtpExternal.portTag
-		    + " or " + OtpExternal.newPortTag
-                            + ", got " + tag);
+		    + ", " + OtpExternal.newPortTag + ", or "
+                     + OtpExternal.v4PortTag + ", got " + tag);
         }
 
         node = read_atom();
-        id = read4BE();
-	if (tag == OtpExternal.portTag)
-	    creation = read1();
-	else
+        if (tag == OtpExternal.v4PortTag) {
+            id = read8BE();
+	    creation = read4BE();            
+        }
+        else if (tag == OtpExternal.newPortTag) {
+            id = (long) read4BE();
 	    creation = read4BE();
+        }
+        else {
+            id = read4BE();
+	    creation = read1();
+        }
 
         return new OtpErlangPort(tag, node, id, creation);
     }
@@ -1033,7 +1055,7 @@ public class OtpInputStream extends ByteArrayInputStream {
         case OtpExternal.newRefTag:
         case OtpExternal.newerRefTag:
             final int arity = read2BE();
-            if (arity > 3) {
+            if (arity > 5) {
 		throw new OtpErlangDecodeException(
 		    "Ref arity " + arity + " too large ");
 	    }
@@ -1225,6 +1247,7 @@ public class OtpInputStream extends ByteArrayInputStream {
 
         case OtpExternal.portTag:
         case OtpExternal.newPortTag:
+        case OtpExternal.v4PortTag:
             return new OtpErlangPort(this);
 
         case OtpExternal.pidTag:
@@ -1267,7 +1290,7 @@ public class OtpInputStream extends ByteArrayInputStream {
 	    return new OtpErlangExternalFun(this);
 
         default:
-            throw new OtpErlangDecodeException("Uknown data type: " + tag);
+            throw new OtpErlangDecodeException("Unknown data type: " + tag);
         }
     }
 

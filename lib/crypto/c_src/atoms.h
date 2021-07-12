@@ -1,7 +1,7 @@
 /*
  * %CopyrightBegin%
  *
- * Copyright Ericsson AB 2010-2018. All Rights Reserved.
+ * Copyright Ericsson AB 2010-2020. All Rights Reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -28,21 +28,23 @@ extern ERL_NIF_TERM atom_true;
 extern ERL_NIF_TERM atom_false;
 extern ERL_NIF_TERM atom_sha;
 extern ERL_NIF_TERM atom_error;
+extern ERL_NIF_TERM atom_pkcs_padding;
+extern ERL_NIF_TERM atom_zero;
+extern ERL_NIF_TERM atom_random;
 extern ERL_NIF_TERM atom_rsa_pkcs1_padding;
 extern ERL_NIF_TERM atom_rsa_pkcs1_oaep_padding;
 extern ERL_NIF_TERM atom_rsa_no_padding;
 extern ERL_NIF_TERM atom_signature_md;
 extern ERL_NIF_TERM atom_undefined;
 
+extern ERL_NIF_TERM atom_hmac;
+extern ERL_NIF_TERM atom_cmac;
+extern ERL_NIF_TERM atom_poly1305;
+
 extern ERL_NIF_TERM atom_ok;
-extern ERL_NIF_TERM atom_not_prime;
-extern ERL_NIF_TERM atom_not_strong_prime;
-extern ERL_NIF_TERM atom_unable_to_check_generator;
-extern ERL_NIF_TERM atom_not_suitable_generator;
-extern ERL_NIF_TERM atom_check_failed;
-extern ERL_NIF_TERM atom_unknown;
 extern ERL_NIF_TERM atom_none;
 extern ERL_NIF_TERM atom_notsup;
+extern ERL_NIF_TERM atom_badarg;
 extern ERL_NIF_TERM atom_digest;
 #ifdef FIPS_SUPPORT
 extern ERL_NIF_TERM atom_enabled;
@@ -51,8 +53,29 @@ extern ERL_NIF_TERM atom_not_enabled;
 extern ERL_NIF_TERM atom_not_supported;
 #endif
 
+extern ERL_NIF_TERM atom_type;
+extern ERL_NIF_TERM atom_size;
+extern ERL_NIF_TERM atom_block_size;
+extern ERL_NIF_TERM atom_key_length;
+extern ERL_NIF_TERM atom_prop_aead;
+extern ERL_NIF_TERM atom_iv_length;
+extern ERL_NIF_TERM atom_mode;
+extern ERL_NIF_TERM atom_encrypt;
+extern ERL_NIF_TERM atom_padding_size;
+extern ERL_NIF_TERM atom_padding_type;
+extern ERL_NIF_TERM atom_ecb_mode;
+extern ERL_NIF_TERM atom_cbc_mode;
+extern ERL_NIF_TERM atom_cfb_mode;
+extern ERL_NIF_TERM atom_ofb_mode;
+extern ERL_NIF_TERM atom_ctr_mode;
+extern ERL_NIF_TERM atom_gcm_mode;
+extern ERL_NIF_TERM atom_ccm_mode;
+extern ERL_NIF_TERM atom_xts_mode;
+extern ERL_NIF_TERM atom_wrap_mode;
+extern ERL_NIF_TERM atom_ocb_mode;
+extern ERL_NIF_TERM atom_stream_cipher;
+
 #if defined(HAVE_EC)
-extern ERL_NIF_TERM atom_ec;
 extern ERL_NIF_TERM atom_prime_field;
 extern ERL_NIF_TERM atom_characteristic_two_field;
 extern ERL_NIF_TERM atom_tpbasis;
@@ -60,6 +83,9 @@ extern ERL_NIF_TERM atom_ppbasis;
 extern ERL_NIF_TERM atom_onbasis;
 #endif
 
+extern ERL_NIF_TERM atom_aes_cbc;
+extern ERL_NIF_TERM atom_aes_ecb;
+extern ERL_NIF_TERM atom_aes_ctr;
 extern ERL_NIF_TERM atom_aes_cfb8;
 extern ERL_NIF_TERM atom_aes_cfb128;
 #ifdef HAVE_GCM
@@ -68,22 +94,16 @@ extern ERL_NIF_TERM atom_aes_gcm;
 #ifdef HAVE_CCM
 extern ERL_NIF_TERM atom_aes_ccm;
 #endif
-#ifdef HAVE_CHACHA20_POLY1305
-extern ERL_NIF_TERM atom_chacha20_poly1305;
-#endif
-#ifdef HAVE_ECB_IVEC_BUG
-extern ERL_NIF_TERM atom_aes_ecb;
-extern ERL_NIF_TERM atom_des_ecb;
-extern ERL_NIF_TERM atom_blowfish_ecb;
-#endif
 
 extern ERL_NIF_TERM atom_rsa;
 extern ERL_NIF_TERM atom_dss;
 extern ERL_NIF_TERM atom_ecdsa;
 
-#ifdef HAVE_ED_CURVE_DH
+#ifdef HAVE_EDDH
 extern ERL_NIF_TERM atom_x25519;
 extern ERL_NIF_TERM atom_x448;
+extern ERL_NIF_TERM atom_ed25519;
+extern ERL_NIF_TERM atom_ed448;
 #endif
 
 extern ERL_NIF_TERM atom_eddsa;
@@ -103,26 +123,8 @@ extern ERL_NIF_TERM atom_rsa_sslv23_padding;
 #endif
 extern ERL_NIF_TERM atom_rsa_x931_padding;
 extern ERL_NIF_TERM atom_rsa_pss_saltlen;
-extern ERL_NIF_TERM atom_sha224;
-extern ERL_NIF_TERM atom_sha256;
-extern ERL_NIF_TERM atom_sha384;
-extern ERL_NIF_TERM atom_sha512;
-extern ERL_NIF_TERM atom_sha3_224;
-extern ERL_NIF_TERM atom_sha3_256;
-extern ERL_NIF_TERM atom_sha3_384;
-extern ERL_NIF_TERM atom_sha3_512;
-extern ERL_NIF_TERM atom_md5;
-extern ERL_NIF_TERM atom_ripemd160;
 
 #ifdef HAS_ENGINE_SUPPORT
-extern ERL_NIF_TERM atom_bad_engine_method;
-extern ERL_NIF_TERM atom_bad_engine_id;
-extern ERL_NIF_TERM atom_ctrl_cmd_failed;
-extern ERL_NIF_TERM atom_engine_init_failed;
-extern ERL_NIF_TERM atom_register_engine_failed;
-extern ERL_NIF_TERM atom_add_engine_failed;
-extern ERL_NIF_TERM atom_remove_engine_failed;
-extern ERL_NIF_TERM atom_engine_method_not_supported;
 
 extern ERL_NIF_TERM atom_engine_method_rsa;
 extern ERL_NIF_TERM atom_engine_method_dsa;

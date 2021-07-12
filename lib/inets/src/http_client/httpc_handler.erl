@@ -598,16 +598,22 @@ do_handle_info({Proto, Socket, Data},
                              "~n", 
                              [Proto, Socket, Data, MFA, 
                               Request, Session, Status, StatusLine, Profile]),
-
+    activate_once(Session),
     {noreply, State};
 
 %% The Server may close the connection to indicate that the
-%% whole body is now sent instead of sending an length
-%% indicator.
-do_handle_info({tcp_closed, _}, State = #state{mfa = {_, whole_body, Args}}) ->
-    handle_response(State#state{body = hd(Args)}); 
-do_handle_info({ssl_closed, _}, State = #state{mfa = {_, whole_body, Args}}) ->
-    handle_response(State#state{body = hd(Args)}); 
+%% whole body is now sent instead of sending a lengh
+%% indicator. In this case the lengh indicator will be
+%% -1.
+do_handle_info({Info, _}, State = #state{mfa = {_, whole_body, Args}})
+  when Info =:= tcp_closed orelse
+       Info =:= ssl_closed ->
+    case lists:last(Args) of
+        Length when Length =< 0 ->
+            handle_response(State#state{body = hd(Args)});
+        _Else ->
+            {stop, {shutdown, server_closed}, State}
+    end;
 
 %%% Server closes idle pipeline
 do_handle_info({tcp_closed, _}, State = #state{request = undefined}) ->
@@ -805,12 +811,11 @@ handle_unix_socket_options(#request{unix_socket = UnixSocket},
             error({badarg, [{ipfamily, Else}, {unix_socket, UnixSocket}]})
     end.
 
-connect_and_send_first_request(Address, #request{ipv6_host_with_brackets = HasBrackets} = Request, 
-                               #state{options = Options0} = State) ->
+connect_and_send_first_request(Address, Request, #state{options = Options0} = State) ->
     SocketType  = socket_type(Request),
     ConnTimeout = (Request#request.settings)#http_options.connect_timeout,
     Options = handle_unix_socket_options(Request, Options0),
-    case connect(SocketType, format_address(Address, HasBrackets), Options, ConnTimeout) of
+    case connect(SocketType, format_address(Address), Options, ConnTimeout) of
         {ok, Socket} ->
             ClientClose =
 		httpc_request:is_client_closing(
@@ -828,12 +833,11 @@ connect_and_send_first_request(Address, #request{ipv6_host_with_brackets = HasBr
                     TmpState = State#state{request = Request,
                                            session = Session,
                                            mfa = init_mfa(Request, State),
-                                           status_line = init_status_line(Request),
+                                           status_line = undefined,
                                            headers = undefined,
                                            body = undefined,
                                            status = new},
-                    http_transport:setopts(SocketType,
-                                           Socket, [{active, once}]),
+                    activate_once(Session),
                     NewState = activate_request_timeout(TmpState),
                     {ok, NewState};
                 {error, Reason} ->
@@ -967,18 +971,16 @@ handle_http_body(_, #state{status = {ssl_tunnel, Request},
 %% terminated by the first empty line after the header fields.
 %% This implies that chunked encoding MUST NOT be used for these
 %% status codes.
-handle_http_body(<<>>, #state{headers = Headers,
+handle_http_body(Body, #state{headers = Headers,
                               status_line = {_,StatusCode, _}} = State)
   when Headers#http_response_h.'transfer-encoding' =/= "chunked" andalso
        (StatusCode =:= 204 orelse                       %% No Content
         StatusCode =:= 304 orelse                       %% Not Modified
         100 =< StatusCode andalso StatusCode =< 199) -> %% Informational
-    handle_response(State#state{body = <<>>});
+    handle_response(State#state{body = Body});
 
-
-handle_http_body(<<>>, #state{headers = Headers,
-                              request = #request{method = head}} = State)
-  when Headers#http_response_h.'transfer-encoding' =/= "chunked" ->
+%% Ignore the body of response to a HEAD method
+handle_http_body(_Body, #state{request = #request{method = head}} = State) ->
     handle_response(State#state{body = <<>>});
 
 handle_http_body(Body, #state{headers       = Headers, 
@@ -1241,7 +1243,12 @@ case_insensitive_header(Str) ->
     Str.
 
 activate_once(#session{socket = Socket, socket_type = SocketType}) ->
-    http_transport:setopts(SocketType, Socket, [{active, once}]).
+    case http_transport:setopts(SocketType, Socket, [{active, once}]) of
+        ok ->
+            ok;
+        {error, _} -> %% inet can return einval instead of closed
+            self() ! {http_transport:close_tag(SocketType), Socket}
+    end.
 
 close_socket(#session{socket = {remote_close,_}}) ->
     ok;
@@ -1460,21 +1467,8 @@ is_no_proxy_dest_address(Dest, AddressPart) ->
     lists:prefix(AddressPart, Dest).
 
 init_mfa(#request{settings = Settings}, State) ->
-    case Settings#http_options.version of
-	"HTTP/0.9" ->
-	    {httpc_response, whole_body, [<<>>, -1]};
-	_ ->
-	    Relaxed = Settings#http_options.relaxed,
-	    {httpc_response, parse, [State#state.max_header_size, Relaxed]}
-    end.
-
-init_status_line(#request{settings = Settings}) ->
-    case Settings#http_options.version of
-	"HTTP/0.9" ->
-	    {"HTTP/0.9", 200, "OK"};
-	_ ->
-	    undefined
-    end.
+	Relaxed = Settings#http_options.relaxed,
+	{httpc_response, parse, [State#state.max_header_size, Relaxed]}.
 
 socket_type(#request{scheme = http}) ->
     ip_comm;
@@ -1584,8 +1578,7 @@ send_raw(SocketType, Socket, ProcessBody, Acc) ->
             end
     end.
 
-tls_tunnel(Address, Request, #state{session = #session{socket = Socket, 
-						       socket_type = SocketType} = Session} = State, 
+tls_tunnel(Address, Request, #state{session = #session{} = Session} = State, 
 	   ErrorHandler) ->
     UpgradeRequest = tls_tunnel_request(Request), 
     case httpc_request:send(Address, Session, UpgradeRequest) of
@@ -1593,12 +1586,10 @@ tls_tunnel(Address, Request, #state{session = #session{socket = Socket,
 	    TmpState = State#state{request = UpgradeRequest,
 				   %%  session = Session,
 				   mfa = init_mfa(UpgradeRequest, State),
-				   status_line =
-				       init_status_line(UpgradeRequest),
+				   status_line = undefined,
 				   headers = undefined,
 				   body = undefined},
-	    http_transport:setopts(SocketType,
-				   Socket, [{active, once}]),
+	    activate_once(Session),
 	    NewState = activate_request_timeout(TmpState),
 	    {ok, NewState#state{status = {ssl_tunnel, Request}}};
 	{error, Reason} ->
@@ -1640,7 +1631,7 @@ host_header(#http_request_h{host = Host}, _) ->
 
 %% Handles headers_as_is
 host_header(_, URI) ->
-    {ok, {_, _, Host, _, _, _}} =  http_uri:parse(URI),
+    #{host := Host} = uri_string:parse(URI),
     Host.
 
 tls_upgrade(#state{status = 
@@ -1664,12 +1655,11 @@ tls_upgrade(#state{status =
 			type = SessionType,
 			client_close = ClientClose},
 	    httpc_request:send(Address, Session, Request), 
-	    http_transport:setopts(SocketType, TLSSocket, [{active, once}]),
+            activate_once(Session),
 	    NewState = State#state{session = Session,
 				   request = Request,
 				   mfa = init_mfa(Request, State),
-				   status_line =
-				       init_status_line(Request),
+				   status_line = undefined,
 				   headers = undefined,
 				   body = undefined,
 				   status = new
@@ -1739,9 +1729,8 @@ update_session(ProfileName, #session{id = SessionId} = Session, Pos, Value) ->
                      {stacktrace, Stacktrace}]}}
     end.
 
-
-format_address({Host, Port}, true) when is_list(Host)->
-    {ok, Address} = inet:parse_address(string:strip(string:strip(Host, right, $]), left, $[)),
+format_address({[$[|T], Port}) ->
+    {ok, Address} = inet:parse_address(string:strip(T, right, $])),
     {Address, Port};
-format_address(HostPort, _) ->
+format_address(HostPort) ->
     HostPort.

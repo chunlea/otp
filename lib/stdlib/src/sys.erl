@@ -1,7 +1,7 @@
 %%
 %% %CopyrightBegin%
 %% 
-%% Copyright Ericsson AB 1996-2018. All Rights Reserved.
+%% Copyright Ericsson AB 1996-2019. All Rights Reserved.
 %% 
 %% Licensed under the Apache License, Version 2.0 (the "License");
 %% you may not use this file except in compliance with the License.
@@ -31,13 +31,16 @@
 	 install/2, install/3, remove/2, remove/3]).
 -export([handle_system_msg/6, handle_system_msg/7, handle_debug/4,
 	 print_log/1, get_log/1, get_debug/3, debug_options/1, suspend_loop_hib/6]).
--deprecated([{get_debug,3,eventually}]).
+
+-deprecated([{get_debug,3,
+              "incorrectly documented and only for internal use. Can often "
+              "be replaced with sys:get_log/1"}]).
 
 %%-----------------------------------------------------------------
 %% Types
 %%-----------------------------------------------------------------
 
--export_type([dbg_opt/0]).
+-export_type([dbg_opt/0, dbg_fun/0, debug_option/0]).
 
 -type name()         :: pid() | atom()
                       | {'global', term()}
@@ -51,6 +54,8 @@
                       | {'code_change', Event :: _, State :: _}
                       | {'postpone', Event :: _, State :: _, NextState :: _}
                       | {'consume', Event :: _, State :: _, NextState :: _}
+                      | {'start_timer', Action :: _, State :: _}
+                      | {'insert_timeout', Event :: _, State :: _}
                       | {'enter', State :: _}
                       | {'terminate', Reason :: _, State :: _}
                       | term().
@@ -74,6 +79,16 @@
 -type format_fun()   :: fun((Device :: io:device() | file:io_device(),
 			     Event :: system_event(),
 			     Extra :: term()) -> any()).
+
+-type debug_option() ::
+        'trace'
+      | 'log'
+      | {'log', N :: pos_integer()}
+      | 'statistics'
+      | {'log_to_file', FileName :: file:name()}
+      | {'install',
+         {Func :: dbg_fun(), FuncState :: term()}
+         | {FuncId :: term(), Func :: dbg_fun(), FuncState :: term()}}.
 
 %%-----------------------------------------------------------------
 %% System messages
@@ -734,19 +749,7 @@ nlog_get([_J|R]) ->
 %% Returns: [debug_opts()]
 %%-----------------------------------------------------------------
 
--spec debug_options(Options) -> [dbg_opt()] when
-      Options :: [Opt],
-      Opt :: 'trace'
-           | 'log'
-           | {'log', pos_integer()}
-           | 'statistics'
-           | {'log_to_file', FileName}
-           | {'install', FuncSpec},
-      FileName :: file:name(),
-      FuncSpec :: {Func, FuncState} | {FuncId, Func, FuncState},
-      FuncId :: term(),
-      Func :: dbg_fun(),
-      FuncState :: term().
+-spec debug_options([Opt :: debug_option()]) -> [dbg_opt()].
 debug_options(Options) ->
     debug_options(Options, []).
 
